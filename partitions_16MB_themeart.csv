@@ -1,0 +1,27 @@
+# Custom 16MB partition table: one app slot, the rest handed to pre-baked theme art.
+#
+# Two partitions from the stock default_16MB.csv layout are reclaimed here:
+#
+#   spiffs (3.375 MB) — never used. Spy Cam reads its JPEG frames from the microSD card
+#     (/spycam_frames/, see spycam_view.cpp), so this sat empty from the first build.
+#
+#   app1 + otadata (6.25 MB) — the OTA update slot. Reclaimed deliberately on 2026-08-16:
+#     the Orb is always flashed over USB, wireless updates were never used once, and a
+#     buyer has to flash over USB for their first install regardless. ArduinoOTA and the
+#     browser firmware-upload page are compiled out to match (ORB_OTA_ENABLED in main.cpp
+#     — flip that and this file together, never one alone).
+#
+# What the space buys: theme art pre-converted to raw RGB565 and memory-mapped, so a
+# screen costs no SD read, no PNG decode and no PSRAM. One rich theme is ~3.8 MB, so
+# 9.6 MB also leaves room for two to three complete themes to stay resident at once,
+# which is what makes switching themes instant instead of a re-bake.
+#
+# app0 keeps the stock 6.25 MB (firmware is ~5.5 MB, so ~800 KB of headroom) and nvs
+# keeps its stock offset and size, so stored WiFi credentials survive this change.
+# Flashing writes only the bootloader, the partition table and the app; nvs is untouched.
+#
+# Name,   Type, SubType, Offset,  Size, Flags
+nvs,      data, nvs,     0x9000,  0x5000,
+app0,     app,  factory, 0x10000, 0x640000,
+themeart, data, 0x40,    0x650000,0x9A0000,
+coredump, data, coredump,0xFF0000,0x10000,

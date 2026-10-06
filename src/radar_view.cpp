@@ -1,0 +1,3291 @@
+// Radar scope (M1) + aircraft (M2) + selection (M3) + selectable themes (M4).
+// Pure LVGL, portable. Visual reference: upstream's mockup describes the STOCK skin only;
+// a theme redraws nearly all of this from theme_style.h.
+//   THEME_ORB   : Orb scope: green gradient, square grid, the 7 nearest
+//                    aircraft as yellow balls (emitting waves) + off-range arrows.
+#include "radar_view.h"
+#include "display.h"   // display_lvgl_us(): see the frame profiler below
+#include "curved_text.h"
+#include "app_theme.h"
+#include "app_shell.h"       // knob capture: default view releases it, selection mode grabs it
+#include "config.h"
+#include "geo.h"
+#include "coastline.h"
+#include "roads_sd.h"
+#include "airports.h"
+#include "text_tokens.h"   // shared {token} expansion, see radar_fmt()
+#include "route.h"           // route_request()/route_get() — {from}/{to} tokens in a custom text banner
+#include "custom_radar.h"    // CUSTOM_HAS_RADAR / CUSTOM_RTEXT{1,2,3}_* / CUSTOM_HAS_RADAR_STYLE / CUSTOM_SWEEP_*, CUSTOM_BLIP_*, CUSTOM_SEL_*, CUSTOM_OFFRANGE_*, CUSTOM_CENTER_* — a Launch Kit push's selection banners + visual styling
+#include "radar_sprite.h"    // radar_custom_plate()/radar_custom_overlay()/radar_custom_blip_icon() — the editor's baked background+rings+crosshair / CRT+glass / aircraft-icon layers
+#include "custom_radar_blip.h"   // CUSTOM_HAS_RADAR_BLIP_IMAGE / CUSTOM_RADAR_BLIP_PIVOT_X/Y
+#include "custom_radar_sweep.h"  // CUSTOM_SWEEP_IMAGE_PIVOT_X/Y / CUSTOM_SWEEP_IMAGE_CENTER_X/Y — compile-time, coupled to whichever sweep sprite is baked in
+#include "theme_style.h"
+#include "orb_text_case.h"   // ALL CAPS on a finished line, THEME_CAPS 53
+// Where the Orb is, by name, for the location banner (THEME_CAPS 54). Defined in main.cpp
+// on the device and in sim_main.cpp for the simulator, like every other host_ hook here.
+extern bool host_location_name(char *out, size_t n);
+#include "theme_font.h"   // per-theme fonts, with the compiled font as fallback     // per-theme sweep/blip/selection/off-range/center/RTEXT values — see theme_style.h for what's covered vs. stays compile-time
+#include <lvgl.h>
+#include <math.h>
+#include <stdio.h>
+#include <string.h>
+#include <string>
+#include <map>
+#include <set>
+#include <vector>
+#include <deque>
+#include <algorithm>
+#include <stdlib.h>
+#if defined(ESP_PLATFORM)
+#include <esp_heap_caps.h>
+#else
+// Desktop simulator: no ESP heap caps and no Serial. The flatten/etch code below is
+// shared (the sim benefits from the same architecture), so shim the two device-isms
+// rather than fork the logic. Same pattern wx_radar_client.cpp already uses.
+#include <cstdarg>
+static void *heap_caps_malloc(size_t sz, int) { return malloc(sz); }
+static void heap_caps_free(void *p) { free(p); }
+#define MALLOC_CAP_SPIRAM 0
+#define MALLOC_CAP_8BIT 0
+static struct { void printf(const char *fmt, ...) const { va_list a; va_start(a, fmt); vprintf(fmt, a); va_end(a); } void println(const char *s) const { puts(s); } } Serial;
+#endif
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+// ---- phosphor palette (mockup) ----
+#define COL_GREEN  lv_color_hex(0x1DFF86)
+#define COL_LEAD   lv_color_hex(0x3DFF9A)
+#define COL_INK    lv_color_hex(0xEAFFF3)
+#define COL_SOFT   lv_color_hex(0x9AFFC8)
+#define COL_EMERG  lv_color_hex(0xFF5A3C)
+// coastline outline — steel blue, deliberately off the red/amber/lime/green/cyan
+// altitude-trail palette so land never reads as an aircraft track. Aviator theme
+// swaps in a sepia/brass equivalent so it reads as an aged chart, not a scope.
+#define COAST_COLOR lv_color_hex(0x4E86C6)
+#define COAST_COLOR_AVI lv_color_hex(0x6B5638)
+// roads (from the SD card, see roads_sd.cpp) — a muted neutral grey, distinct from
+// both the coastline's blue and the airport markers' grey-blue so all three read
+// as separate layers rather than blurring together.
+#define ROAD_COLOR lv_color_hex(0x707868)
+#define ROAD_COLOR_AVI lv_color_hex(0x8A7F63)
+// airport markers — a neutral muted grey-blue so they sit quietly under the traffic.
+#define AIRPORT_COLOR lv_color_hex(0x8A93A6)
+#define AIRPORT_COLOR_AVI lv_color_hex(0x9C8F73)
+// ---- aviator palette (WWII scope: brass rings, ivory sweep/ink, warm chrome) ----
+#define AVI_RING lv_color_hex(0x6B5A3A)
+#define AVI_LEAD lv_color_hex(0xDACFA6)
+#define AVI_INK  lv_color_hex(0xEDE3CC)
+#define AVI_SOFT lv_color_hex(0x9C8F73)
+#define AVI_BG   lv_color_hex(0x14100A)
+// ---- orb palette (Orb) ----
+#define ORB_BLIP   lv_color_hex(0xFFE11A)
+#define ORB_EMERG  lv_color_hex(0xFF4D2E)
+#define ORB_ACCENT lv_color_hex(0xFF8A1E)
+#define ORB_GRID   lv_color_hex(0x3F8B30)
+#define ORB_BG_TOP lv_color_hex(0x18540F)
+#define ORB_BG_BOT lv_color_hex(0x09250A)
+#define ORB_FLOW   lv_color_hex(0xFFC24D)
+
+// ---- sweep config ----
+#define SWEEP_PERIOD_MS   8000
+// Sweep redraw cadence. Every tick invalidates the sweep's rotated bounding box, and
+// LVGL must then re-blend every layer intersecting it — with this theme that is seven
+// layers, two of them full-screen with alpha. Measured on device: ~250 ms of compositing
+// per frame, i.e. ~4 fps, while this timer was asking for a redraw every 30 ms. Asking
+// eight times faster than the hardware can deliver does not make it faster, it just
+// queues more invalidation work behind an already-late frame.
+//
+// Now that the sweep advances by REAL elapsed time (see sweep_timer_cb), a slower tick
+// does not slow the rotation down — it just takes bigger angular steps per redraw. So
+// this is chosen to be achievable rather than aspirational.
+// Ask for frames at a rate the hardware can actually meet. This theme composites for
+// ~166 ms per frame (measured: 6 fps, 88% of every second inside LVGL), and this timer was
+// asking every 66 ms, two and a half times faster. The surplus requests do not produce
+// surplus frames; they just land whenever the renderer gets to them, so the gaps between
+// redraws are irregular. Since the sweep advances by real elapsed time, irregular gaps
+// become irregular angular steps, which is the jitter Zion could see.
+//
+// Slower and regular beats faster and ragged here: a steady sweep is what makes this read
+// as an instrument, and that was Zion's explicit priority over everything else on screen.
+// Paced to what this device can ACTUALLY render, not to what looks good on paper.
+//
+// This was 66 ms (15 fps requested). Measured on hardware, a Flight Tracker frame takes
+// 66-160 ms, averaging 81: the minimum is exactly this timer period, and everything above
+// it is the renderer failing to keep up. So the timer was asking for frames faster than
+// they could be drawn, and the overshoot landed as uneven arrival — 66 ms then 160 ms then
+// 70 — which is precisely the stutter the eye picks up. A frame rate you cannot hit is not
+// a frame rate, it is a source of jitter.
+//
+// Zion's priority is explicit and this follows it: perfectly even motion beats a higher
+// number. At 100 ms the timer, not the renderer, decides when frames happen almost all of
+// the time, so they arrive evenly. Costs ~2 fps and buys consistency.
+// Measured, not guessed. Three values tried on the hardware, steady-state frame-time
+// spread (the thing the eye actually reads as stutter):
+//     66 ms  -> avg 81 ms,  spread 94-99 ms    (the old value: asking for frames it cannot draw)
+//    100 ms  -> avg 103 ms, spread 55-60 ms    <- best
+//    120 ms  -> avg 123 ms, spread 122-157 ms  (worse: heavy frames land as bigger multiples)
+#define SWEEP_FRAME_MS    100
+#define SWEEP_TRAIL_DEG   38.0f
+#define SWEEP_TRAIL_STEPS 20
+#define SWEEP_TRAIL_OPA   72
+
+// ---- aircraft / flow / orb config ----
+// How often aircraft glyphs are allowed to move. Deliberately coarse, and it is a product
+// decision rather than a performance accident: a steady sweep is what makes this read as an
+// instrument, while an aircraft's position being two seconds stale is invisible. Zion chose
+// that trade explicitly.
+//
+// Each step invalidates one box per aircraft that moved, and with ~28 contacts on screen
+// every one of those boxes forces LVGL to re-blend all the layers it touches. That was the
+// variable cost per frame, and variable cost is exactly what the sweep cannot tolerate:
+// because the sweep advances by real elapsed time, an unusually slow frame makes it take an
+// unusually big angular jump. Correct speed, uneven motion. Measured before this change:
+// 88% of every second inside LVGL, frame rate wandering 5-7 fps.
+//
+// Time-gated rather than counted in frames, so the cadence stays 2 s whatever the frame
+// rate is doing. A frame counter would have made this drift with the very thing it is
+// meant to stabilise.
+// Matched to how far a glyph actually travels, which is the only thing that decides how
+// many steps are worth taking. An aircraft crosses about 30 px of a 30 km scope between
+// polls ten seconds apart, so 250 ms gives about forty steps for thirty pixels of travel:
+// slightly more than one step per pixel, and anything faster is work that cannot change a
+// single pixel on the glass.
+//
+// It was 2000, which is five steps across a whole poll, and that was chosen to protect a
+// frame budget. The A/B above says the budget was never at risk: 80 ms and 2000 ms both
+// held 9 fps, because the steps are one pixel each whatever their cadence.
+#define AC_INTERP_MS      250
+// Overridable over the cable (?orb interpms), so the cost of a faster glide can be measured
+// by sweeping the value on a running Orb rather than reflashing once per trial. Zero means
+// use AC_INTERP_MS. Deliberately not persisted: it is an instrument, not a setting.
+static uint32_t s_acInterpMs = 0;
+// -1 auto (custom designs snap, built-ins glide), 0 force snap, 1 force glide. Never
+// persisted: an instrument, not a setting.
+static int s_forceGlide = -1;
+// 0 = the design's own count. An instrument, never persisted.
+static int s_forceTrailSteps = 0;
+// Set when the style changes under a running screen, so the pacing is measured fresh.
+static bool s_pacingStale = true;
+#define TRAIL_MAX         7
+#define TAP_RADIUS_PX     40    // generous finger-tap catch radius (picks the nearest glyph within it)
+#define FLOW_MAX          240   // see setTrailLength: repaint cost is ~300 us per segment
+#define FLOW_REDRAW_EVERY 80
+#define FLOW_OPA          55
+#define ORB_BLIPS      7
+#define ORB_ARROWS     8
+#define BALL_R            9
+#define WAVE_EXPAND       28.0f
+
+static int        s_theme    = THEME_AVIATOR;
+static void      (*s_themeCb)(int) = nullptr;
+// scope "chrome" palette (rings/sweep/crosshair/labels) — retinted per theme
+static lv_color_t s_cRing = COL_GREEN, s_cLead = COL_LEAD, s_cInk = COL_INK, s_cSoft = COL_SOFT;
+static const char *THEME_NAMES[THEME_COUNT] = { "ORB", "MILITARY", "AVIATOR" };
+// First-entry loading notice. Opening the Flight Tracker from cold does real work
+// before there is anything to show: the coastline, airports and roads are all projected
+// for this location, the map is etched, and the first aircraft snapshot has to arrive.
+// The sweep starts turning and then visibly stops for a few seconds, which reads as a
+// crash rather than as loading. So say what is happening.
+static lv_obj_t   *s_loading         = nullptr;
+static bool        s_loadingPending  = false;   // shown, waiting for the first update()
+static uint32_t    s_loadStartMs     = 0;       // lv_tick_get() when loading began, for the elapsed-time line
+static int         s_loadShownSec    = -1;      // last elapsed-second value painted, so a still-frozen number is never redrawn as "live"
+static lv_obj_t   *s_themeLabel      = nullptr;   // "AVIATOR" etc. banner, shown briefly on a theme change
+static lv_timer_t *s_themeLabelTimer = nullptr;   // one-shot: hides the banner after ~2s
+static lv_obj_t  *s_parent   = nullptr;
+static lv_obj_t  *s_gridLayer = nullptr;
+static lv_obj_t  *s_sweep     = nullptr;
+static lv_obj_t  *s_wxSweep   = nullptr;   // the weather map's own, on its own tile
+static lv_obj_t  *s_sweepImg  = nullptr;   // the sweep's "image" type — rotated live, replaces s_sweep's vector wedge when active
+static lv_obj_t  *s_acLayer   = nullptr;
+static lv_obj_t  *s_flowCanvas = nullptr;
+static lv_color_t *s_flowBuf  = nullptr;
+static lv_obj_t  *s_rose[4]   = {nullptr, nullptr, nullptr, nullptr};
+static lv_obj_t  *s_centerDot = nullptr;
+static lv_obj_t  *s_pulse     = nullptr;
+static lv_obj_t  *s_rangeLbl  = nullptr;
+static bool       s_rangeLblVisible = true;
+static bool       s_sweepEnabled    = true;
+static bool       s_airportsEnabled = true;
+static int        s_maxOnScreen     = 12;          // how many (nearest) aircraft to draw (web-configurable)
+static bool       s_bigText         = false;       // accessibility: bigger glyph labels (set before init)
+static int        s_trailMax        = TRAIL_MAX;   // per-aircraft trail length (0 = off)
+static int        s_flowMax         = FLOW_MAX;    // persistent flow-layer segments, count cap (0 = off)
+static int        s_flowGenMax      = 14;          // ...and an age cap in polls (~2 s each) so tracks fade out
+static lv_timer_t *s_timer    = nullptr;
+static float       s_sweepDeg = 0.0f;
+// The weather map's own angle, advanced in the SAME callback off the SAME smoothed frame
+// time, just at its own rate. The two used to share s_sweepDeg outright, which is why the
+// weather theme's sweepSpeed was a slider in Orb Studio that moved nothing: there was only
+// one speed and it belonged to the Flight Tracker. Sharing the TIMER is what keeps the
+// motion even; sharing the ANGLE was never the part that mattered.
+static float       s_wxSweepDeg = 0.0f;
+// Sweep pacing state, at file scope so the loading gate can reset it. A multi-second
+// stall during first-entry projection would otherwise poison the smoothed frame time and
+// make the sweep lurch on its first few steps after the wait.
+static uint32_t    s_lastSweepMs = 0;
+static float       s_emaDtMs     = 0.0f;
+static float       s_prevSweepDeg = 0.0f;
+static float       s_wxPrevSweepDeg = 0.0f;
+static float       s_wavePhase = 0.0f;
+static uint32_t    s_lastUpdateMs = 0;       // smooth-motion: cadence + animation clock
+static uint32_t    s_animStartMs  = 0;
+static uint32_t    s_pollMs       = POLL_INTERVAL_MS;
+static int         s_frameCtr     = 0;
+static lv_coord_t  s_cx = SCREEN_CX, s_cy = SCREEN_CY;
+static std::string s_selHex;
+// Flight Tracker knob state machine (shared by device + simulator so they can't
+// drift). Two modes: DEFAULT VIEW — nothing selected, knob released, a turn opens
+// the app switcher and a push enters selection. SELECTION MODE — an aircraft
+// selected, knob captured, a turn cycles aircraft; a push, or SELECT_IDLE_MS of no
+// input, drops back to the default view. See knobPress()/knobTurn()/knobEnter().
+static bool        s_selectMode    = false;
+static uint32_t    s_selActivityMs = 0;      // lv_tick_get() of the last knob input in selection mode
+// How long a selected aircraft stays selected without input.
+//
+// Was 5000, which was never long enough to read the card even when it worked. The route
+// line ("PHX -> SFO") is fetched on demand from a second service, and that lookup queues
+// behind the ADS-B poll and the weather pumps on the same task — so the card could easily
+// time out before its own text arrived. That is now much likelier to succeed at all (the
+// lookup used TLS this board cannot do, see route_client.cpp), but it is still a network
+// round trip, and five seconds was a window you had to race.
+static constexpr uint32_t SELECT_IDLE_MS = 5000;
+static void radar_exit_select();             // -> default view (deselect + release knob); defined below
+// Called when late-arriving detail (the route) reaches a card that is already up. Restarts
+// the idle countdown, because the thing worth reading only just appeared: without this the
+// route could land with a second left on the clock and vanish as you registered it.
+void noteSelectionDetailArrived();
+static float       s_lastRangeKm = 0.0f;     // current scope range, for the range banner (radar_range_fmt)
+static lv_obj_t   *s_feedWarn   = nullptr;   // "the feed is down, not your Orb" banner
+static lv_obj_t   *s_loadTicker = nullptr;   // live elapsed-seconds line under the loading message
+static lv_obj_t   *s_textCanvas = nullptr;   // callsign/stats/route banners (curved+glow capable), a Launch Kit push
+// The selection card: a plate under those banners, parked on the far side of the scope
+// from whatever is selected. Two objects rather than one drawn shape, so LVGL does the
+// rounded corners, the border and the compositing itself — the text canvas above stays
+// purely text, and a glyph's glow lands over the card correctly instead of losing to it
+// under the canvas's own "higher opacity wins" rule.
+static lv_obj_t   *s_cardObj  = nullptr;     // the drawn (vector) card
+static lv_obj_t   *s_cardImg  = nullptr;     // the image card
+static lv_color_t *s_textBuf    = nullptr;
+static lv_obj_t   *s_plateImg   = nullptr;   // baked background (bottom layer), a Launch Kit push
+static lv_obj_t   *s_ringsImg   = nullptr;   // etched rings+crosshair, above the map, below the sweep (THEME_CAPS 6)
+static lv_obj_t   *s_overlayImg = nullptr;   // baked CRT+glass (top layer), a Launch Kit push
+static lv_obj_t   *s_staticImg[2] = { nullptr, nullptr };   // two plain decorative overlays, a Launch Kit push
+static lv_obj_t   *s_dimLayer  = nullptr;   // plain full-scope color wash (the "Overlay" card) — reorderable, a Launch Kit push
+
+struct FlowSeg { lv_point_t a, b; uint16_t gen; };   // gen = the poll it was laid down on
+static std::deque<FlowSeg> s_flow;
+static int s_flowRedrawCtr = 0;
+static uint16_t s_flowGen = 0;        // ++ each update(); flow segments fade out after s_flowGenMax polls
+
+struct AcDraw {
+    lv_point_t pos;            // current (animated) screen position — what gets drawn
+    lv_point_t from, to;       // smooth-motion glide endpoints (M4 interpolation)
+    float      track;
+    lv_color_t color;
+    bool       emergency;
+    bool       inRange;
+    char       hex[8];
+    char       call[12];
+    char       type[8];
+    char       altTxt[12];
+    float      altFt;
+    bool       onGround;
+    float      vsFpm, gsKt, distKm, bearingDeg;
+    int        squawk;
+    float      freshness;      // 1.0 = seen this poll, fading to a floor as it ages, see ac_freshness()
+    std::vector<lv_point_t> trail;
+};
+static std::vector<AcDraw> s_acs;
+// Hexes the scope is currently following. See the sticky-selection block in update() for
+// why the set persists between polls instead of being recomputed from distance each time.
+static std::set<std::string> s_tracked;
+static std::map<std::string, std::vector<lv_point_t>> s_trails;
+
+static const float GX[4] = { 0.0f,  7.0f, 0.0f, -7.0f };
+static const float GY[4] = { -11.0f, 5.0f, 8.0f, 5.0f };
+
+// Aviator theme only: a narrow kite for everyday traffic, a wide kite for recognized
+// large/heavy types — same 4-point convex "kite" family as GX/GY above (just resized),
+// not a literal notched silhouette. LVGL's software polygon fill ONLY supports convex
+// polygons (see lv_draw_sw_polygon.c: "Only convex polygons are supported") — an
+// earlier version of this used a notched (concave) shape and hard-locked the device,
+// because a concave input can spin its scanline fill loop forever. Verify convexity
+// (all four cross-products of consecutive edges same sign) before changing these.
+static const float FIGHTER_X[4] = {  0.0f,  4.0f,  0.0f,  -4.0f };
+static const float FIGHTER_Y[4] = { -9.0f,  3.0f,  5.0f,   3.0f };
+static const float BOMBER_X[4]  = {  0.0f, 12.0f,  0.0f, -12.0f };
+static const float BOMBER_Y[4]  = {-14.0f,  4.0f,  9.0f,   4.0f };
+
+// Recognized large/heavy ICAO type-designator prefixes -> draw the bomber silhouette.
+// Everything else (GA, regional, and anything the feed didn't identify) reads as a fighter.
+static bool is_big_type(const char *t) {
+    if (!t || !t[0]) return false;
+    static const char *kBig[] = {
+        "B7", "B4", "A3", "A2", "MD1", "MD9", "DC1", "DC9", "DC8",
+        "IL9", "IL7", "C5", "C17", "KC1", "KC4", "E3", "E4", "P8", "B52", "B1", "B2"
+    };
+    for (const char *p : kBig) if (strncmp(t, p, strlen(p)) == 0) return true;
+    return false;
+}
+
+// Office (see app_theme.h) is a whole-device light skin: it overrides the scope
+// regardless of which of Orb/Military/Aviator is stored, the same way ui_apply_theme()
+// overrides the HUD chrome. Orb's neon grid and Aviator's sepia dial don't have light
+// variants designed for them, so both fold back to the plain ring/crosshair scope below.
+static inline bool officeMode() { return app_theme::get() == APP_THEME_OFFICE; }
+static inline bool orb() { return !officeMode() && s_theme == THEME_ORB; }
+static inline bool aviator() { return !officeMode() && s_theme == THEME_AVIATOR; }
+static inline lv_color_t coast_color()   { return aviator() ? COAST_COLOR_AVI   : COAST_COLOR; }
+static inline lv_color_t airport_color() { return aviator() ? AIRPORT_COLOR_AVI : AIRPORT_COLOR; }
+static inline lv_color_t road_color()    { return aviator() ? ROAD_COLOR_AVI    : ROAD_COLOR; }
+
+// A Launch Kit push with full visual styling (background/rings/crosshair baked
+// into a plate image, sweep/blip/selection/off-range/center as live parameters,
+// CRT/glass baked into an overlay image) — replaces the built-in Orb/Military/
+// Aviator scope look entirely, the same way a custom design already overrides
+// the clock's faces. CUSTOM_HAS_RADAR_STYLE is always defined (0 in the
+// committed stub) by custom_radar.h, so this is cheap and safe to call anywhere.
+static inline bool customStyled() { return (bool)CUSTOM_HAS_RADAR_STYLE; }
+
+static void show(lv_obj_t *o, bool v) {
+    if (!o) return;
+    if (v) lv_obj_clear_flag(o, LV_OBJ_FLAG_HIDDEN);
+    else   lv_obj_add_flag(o, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void hide_theme_label_cb(lv_timer_t * /*t*/) {
+    show(s_themeLabel, false);
+    s_themeLabelTimer = nullptr;   // the one-shot timer already deleted itself
+}
+
+// Flash the theme name at the top of the radar for ~2s, so cycling themes (knob
+// push, touch long-press, a screen tap, or a fresh boot) always shows which one
+// you're on. White text on a solid black plaque so it stays readable over any theme.
+static void show_theme_label(const char *name) {
+    if (!s_themeLabel) return;
+    // Never on a custom design. This banner names the STOCK scope skin (Phosphor/Orb/
+    // Aviator/...), which is meaningless once a Launch Kit theme is driving the screen —
+    // it was appearing as a black "AVIATOR" pill floating over the Steam Punk dial,
+    // because radar::init() ends with setTheme() and setTheme() flashes the name.
+    if (customStyled()) return;
+    lv_label_set_text(s_themeLabel, name);
+    show(s_themeLabel, true);
+    lv_obj_move_foreground(s_themeLabel);
+    if (s_themeLabelTimer) { lv_timer_del(s_themeLabelTimer); s_themeLabelTimer = nullptr; }
+    s_themeLabelTimer = lv_timer_create(hide_theme_label_cb, 2000, nullptr);
+    lv_timer_set_repeat_count(s_themeLabelTimer, 1);
+}
+
+static lv_color_t alt_color(float altFt, bool onGround) {
+    if (officeMode()) {                           // darker ramp than the neon default — legible on white
+        if (onGround)      return lv_color_hex(0x8A8F98);
+        if (altFt < 3000)  return lv_color_hex(0xE1341F);
+        if (altFt < 10000) return lv_color_hex(0xE08A00);
+        if (altFt < 20000) return lv_color_hex(0x8FA300);
+        if (altFt < 30000) return lv_color_hex(0x1C8A4B);
+        return lv_color_hex(0x1E6FE0);
+    }
+    if (aviator()) {                              // warm rust->ivory ramp, same low->high order
+        if (onGround)      return lv_color_hex(0x8A7F6B);
+        if (altFt < 3000)  return lv_color_hex(0xB0402C);
+        if (altFt < 10000) return lv_color_hex(0xC97A2E);
+        if (altFt < 20000) return lv_color_hex(0xC9A227);
+        if (altFt < 30000) return lv_color_hex(0xE8DCC0);
+        return lv_color_hex(0xF2ECDD);
+    }
+    if (onGround)      return lv_color_hex(0x888888);
+    if (altFt < 3000)  return lv_color_hex(0xFF5A3C);
+    if (altFt < 10000) return lv_color_hex(0xFFB23C);
+    if (altFt < 20000) return lv_color_hex(0xC8FF3C);
+    if (altFt < 30000) return lv_color_hex(0x39FF14);
+    return lv_color_hex(0x3CE0FF);
+}
+
+// Full brightness for the first 25 s, which is two and a half polls, then fading linearly
+// to AC_DIM_FLOOR_OPA by 75 s and held there until the table drops the entry entirely at
+// AC_HARD_EXPIRE_MS (main.cpp's applyPolledAircraft — this never sees one older). Never
+// reaches zero before removal: the point is to SAY a contact has gone quiet, not to make it
+// disappear piecemeal ahead of actually being gone.
+// The banner may never arrive before anything on the dial looks stale. That ordering IS the
+// 2026-08-24 fix: "No aircraft data" over full-brightness traffic is the instrument
+// contradicting itself. Fading first and announcing later is a graduated warning and is
+// fine. A comment cannot fail; this can.
+static_assert(ADSB_NO_DATA_MS >= AC_DIM_START_MS,
+              "the no-data banner must not appear before the contacts start dimming");
+
+static float ac_freshness(uint32_t ageMs) {
+    if (ageMs <= AC_DIM_START_MS) return 1.0f;
+    if (ageMs >= AC_DIM_FLOOR_MS) return AC_DIM_FLOOR_OPA;
+    const float span = (float)(AC_DIM_FLOOR_MS - AC_DIM_START_MS);
+    return 1.0f - (1.0f - AC_DIM_FLOOR_OPA) * (float)(ageMs - AC_DIM_START_MS) / span;
+}
+
+static inline lv_opa_t scale_opa(lv_opa_t base, float mul) {
+    return (lv_opa_t)lroundf((float)base * (mul < 0.0f ? 0.0f : (mul > 1.0f ? 1.0f : mul)));
+}
+
+static inline lv_point_t rim_point(float bearingDeg, float r) {
+    const float a = bearingDeg * (float)M_PI / 180.0f;
+    lv_point_t p;
+    p.x = (lv_coord_t)lroundf((float)s_cx + r * sinf(a));
+    p.y = (lv_coord_t)lroundf((float)s_cy - r * cosf(a));
+    return p;
+}
+
+// rotate the local point (px,py) by `deg` (clockwise, screen coords) and offset to (ox,oy)
+static inline lv_point_t rot_pt(float px, float py, float deg, lv_coord_t ox, lv_coord_t oy) {
+    const float a = deg * (float)M_PI / 180.0f;
+    const float c = cosf(a), s = sinf(a);
+    lv_point_t p;
+    p.x = (lv_coord_t)(ox + (lv_coord_t)lroundf(px * c - py * s));
+    p.y = (lv_coord_t)(oy + (lv_coord_t)lroundf(px * s + py * c));
+    return p;
+}
+
+// =============================== flow map ====================================
+// ---- lazy full-screen canvases ---------------------------------------------
+// The flow (aircraft-trail) canvas and the selection-banner text canvas are each a
+// 636 KB PSRAM buffer AND a full-screen alpha layer that every sweep frame must blend
+// through. Both were allocated at boot and held forever, which (a) fragmented PSRAM —
+// largest free block measured at 423 KB while Flight Tracker was open, below the 651 KB
+// the menu's own canvas needs, which is exactly the black-menu-with-white-text failure —
+// and (b) taxed every frame for features that are usually inactive: trails are a
+// settings toggle, and the banners only exist while an aircraft is selected.
+//
+// Lifecycle now matches everything else on this device: acquire when there is something
+// to show, release when there is not. While unbuffered, the canvas object stays HIDDEN,
+// so LVGL also skips it entirely during composition.
+static bool canvas_acquire(lv_obj_t *canvas, lv_color_t *&buf, const char *tag) {
+    if (!canvas) return false;
+    if (buf) return true;
+    const size_t sz = LV_CANVAS_BUF_SIZE_TRUE_COLOR_ALPHA(SCREEN_W, SCREEN_H);
+#if defined(ESP_PLATFORM)
+    buf = (lv_color_t *)heap_caps_malloc(sz, MALLOC_CAP_SPIRAM);
+#else
+    buf = (lv_color_t *)malloc(sz);
+#endif
+    if (!buf) {
+        printf("[radar] %s canvas alloc FAILED (%u bytes) — feature skipped this session\n",
+               tag, (unsigned)sz);
+        return false;
+    }
+    lv_canvas_set_buffer(canvas, buf, SCREEN_W, SCREEN_H, LV_IMG_CF_TRUE_COLOR_ALPHA);
+    lv_canvas_fill_bg(canvas, lv_color_black(), LV_OPA_TRANSP);
+    lv_obj_clear_flag(canvas, LV_OBJ_FLAG_HIDDEN);
+    return true;
+}
+
+static void canvas_release(lv_obj_t *canvas, lv_color_t *&buf) {
+    if (!buf) return;
+    if (canvas) {
+        lv_img_set_src(canvas, (const void *)NULL);   // detach before freeing: LVGL must never repaint from a freed buffer
+        lv_obj_add_flag(canvas, LV_OBJ_FLAG_HIDDEN);
+    }
+#if defined(ESP_PLATFORM)
+    heap_caps_free(buf);
+#else
+    free(buf);
+#endif
+    buf = nullptr;
+}
+
+static void flow_draw_seg(const FlowSeg &s) {
+    if (!s_flowCanvas || !s_flowBuf) return;
+    lv_draw_line_dsc_t d;
+    lv_draw_line_dsc_init(&d);
+    d.color = orb() ? ORB_FLOW : s_cRing;
+    d.width = 2;
+    d.opa = FLOW_OPA;
+    lv_point_t pts[2] = { s.a, s.b };
+    lv_canvas_draw_line(s_flowCanvas, pts, 2, &d);
+}
+
+static void flow_redraw_all(void) {
+    if (!s_flowCanvas) return;
+    if (s_flow.empty()) { canvas_release(s_flowCanvas, s_flowBuf); return; }
+    if (!canvas_acquire(s_flowCanvas, s_flowBuf, "flow")) return;
+    lv_canvas_fill_bg(s_flowCanvas, lv_color_black(), LV_OPA_TRANSP);
+    for (const FlowSeg &s : s_flow) flow_draw_seg(s);
+}
+
+// =============================== grid ========================================
+// Where a radar frame goes.
+//
+// The scope runs at 8 or 9 a second on the Modern design, and its sweep arrives every 100 ms
+// at best and 260 at worst — a spread of 100 to 160 ms in a 15 second window. That variance
+// is the stutter Zion can see, and radar_view's own comment already says why: what the eye
+// catches is not a low frame rate, it is uneven steps.
+//
+// The same question the clock's face answered last night, asked of this screen: which layer
+// owns the frame. Four micros() calls a frame and one line every ten seconds, and it settles
+// what to do instead of another round of reasoning about it.
+#ifdef ARDUINO
+enum { RP_GRID = 0, RP_SWEEP, RP_AC, RP_WX, RP_N };
+static uint32_t s_rp[RP_N] = { 0 };
+static uint32_t s_rpFrames = 0, s_rpAt = 0, s_rpLvgl = 0;
+static const char *RP_NAME[RP_N] = { "grid", "sweep", "aircraft", "wx" };
+struct RadarPhase {
+    int slot; uint32_t t0;
+    explicit RadarPhase(int s) : slot(s), t0(micros()) {}
+    ~RadarPhase() { s_rp[slot] += micros() - t0; }
+};
+#define RADAR_PHASE(x) RadarPhase _rp(x)
+static void radar_phase_report(void) {
+    ++s_rpFrames;
+    const uint32_t now = millis();
+    if (now - s_rpAt <= 10000) return;
+    if (s_rpAt && s_rpFrames) {
+        uint32_t tot = 0;
+        for (int i = 0; i < RP_N; ++i) tot += s_rp[i];
+        Serial.printf("[rframe] %lu frames, %lu us each:", (unsigned long)s_rpFrames,
+                      (unsigned long)(tot / s_rpFrames));
+        for (int i = 0; i < RP_N; ++i)
+            Serial.printf(" %s %lu", RP_NAME[i], (unsigned long)(s_rp[i] / s_rpFrames));
+        Serial.printf(" | lvgl %lu us/frame\n",
+                      (unsigned long)((display_lvgl_us() - s_rpLvgl) / s_rpFrames));
+    }
+    s_rpAt = now; s_rpFrames = 0;
+    for (int i = 0; i < RP_N; ++i) s_rp[i] = 0;
+    s_rpLvgl = display_lvgl_us();
+}
+#else
+#define RADAR_PHASE(x) do { } while (0)
+static void radar_phase_report(void) {}
+#endif
+
+static void grid_draw_cb(lv_event_t *e) {
+    RADAR_PHASE(RP_GRID);
+    lv_draw_ctx_t *d = lv_event_get_draw_ctx(e);
+    const lv_point_t c = { s_cx, s_cy };
+
+    // A pushed design bakes its own rings/crosshair (and Orb's grid/"you are
+    // here" triangle don't apply to a custom look at all) into the plate image
+    // set up in init()/refreshCustomStyle() — this layer only still owes the
+    // coastline/airport markers, which are the device's own native OSM data,
+    // not something a design push carries.
+    if (customStyled()) {
+        // The theme's map, not the firmware's. Roads used to be drawn here in one fixed
+        // grey whatever the design was doing, which a dark or a sepia dial had no way to
+        // argue with. Colour, strength and whether they draw at all now travel with the
+        // theme; the defaults in theme_style.h are the exact constants used before, so a
+        // theme that says nothing about the map is unchanged.
+        const theme_style::Radar &rs = theme_style::radar();
+        // Clamped rather than trusted: this is a stroke width handed straight to LVGL, and a
+        // zero draws nothing while a large one is mostly a way to fill the dial with roads.
+        if (rs.mapRoadsOn) {
+            const lv_coord_t rw = (lv_coord_t)(rs.mapRoadWidth < 1 ? 1 : (rs.mapRoadWidth > 8 ? 8 : rs.mapRoadWidth));
+            roads_sd::draw(d, lv_color_hex(rs.mapRoadColor), (lv_opa_t)rs.mapRoadOpacity, rw);
+        }
+        // Coastline/waterways deliberately not drawn under a custom design. Inland it is
+        // canals and washes rather than a recognisable shoreline, and on a 466 px dial it
+        // read as clutter competing with the roads. The data still ships and the stock
+        // scopes below still draw it; only the themed path opts out.
+        //
+        // Airports still answer to the device's own setting as well: it is a preference
+        // about what the owner wants to see, not only about how a theme looks.
+        if (s_airportsEnabled && rs.mapAirportsOn) airports_draw(d, lv_color_hex(rs.mapAirportColor), 150);
+        return;
+    }
+
+    if (orb()) {
+        lv_draw_line_dsc_t gl;
+        lv_draw_line_dsc_init(&gl);
+        gl.color = ORB_GRID;
+        gl.width = 1;
+        gl.opa = 120;
+        const int step = 38;
+        for (int x = s_cx % step; x < SCREEN_W; x += step) {
+            lv_point_t p1 = { (lv_coord_t)x, 0 }, p2 = { (lv_coord_t)x, SCREEN_H - 1 };
+            lv_draw_line(d, &gl, &p1, &p2);
+        }
+        for (int y = s_cy % step; y < SCREEN_H; y += step) {
+            lv_point_t p1 = { 0, (lv_coord_t)y }, p2 = { SCREEN_W - 1, (lv_coord_t)y };
+            lv_draw_line(d, &gl, &p1, &p2);
+        }
+        // center "you are here" triangle (orange, pointing up)
+        lv_point_t tri[3] = { rot_pt(0, -11, 0, s_cx, s_cy),
+                              rot_pt(10, 8, 0, s_cx, s_cy),
+                              rot_pt(-10, 8, 0, s_cx, s_cy) };
+        lv_draw_rect_dsc_t td;
+        lv_draw_rect_dsc_init(&td);
+        td.bg_color = ORB_ACCENT;
+        td.bg_opa = LV_OPA_COVER;
+        td.border_color = lv_color_hex(0x8A4A00);
+        td.border_width = 1;
+        td.border_opa = 160;
+        roads_sd::draw(d, road_color(), 130, 1);
+        coastline_draw(d, coast_color(), 170, 2);    // landmass outline under the triangle
+        if (s_airportsEnabled) airports_draw(d, airport_color(), 150);
+        lv_draw_polygon(d, &td, tri, 3);
+        return;
+    }
+
+    // roads + coastline first, so the rings/crosshair sit cleanly on top.
+    // Steel blue (sepia in Aviator) + 2 px so the coastline reads as a map
+    // outline, distinct from the altitude-trail palette; roads are a thinner,
+    // more muted neutral so they don't compete with it.
+    roads_sd::draw(d, road_color(), 150, 1);
+    coastline_draw(d, coast_color(), 165, 2);
+    if (s_airportsEnabled) airports_draw(d, airport_color(), 150);
+
+    // phosphor: concentric rings + crosshair
+    lv_draw_arc_dsc_t ad;
+    lv_draw_arc_dsc_init(&ad);
+    ad.color = s_cRing;
+    ad.width = 2;
+    const lv_coord_t rr[4] = { 50, 104, 160, RADAR_R_OUTER_PX };
+    const lv_opa_t   ro[4] = { 66, 66, 66, 87 };
+    for (int i = 0; i < 4; ++i) { ad.opa = ro[i]; lv_draw_arc(d, &ad, &c, rr[i], 0, 360); }
+
+    lv_draw_line_dsc_t ll;
+    lv_draw_line_dsc_init(&ll);
+    ll.color = s_cRing;
+    ll.width = 2;
+    ll.opa = 41;
+    lv_point_t h1 = { (lv_coord_t)(s_cx - 211), s_cy }, h2 = { (lv_coord_t)(s_cx + 211), s_cy };
+    lv_point_t v1 = { s_cx, (lv_coord_t)(s_cy - 211) }, v2 = { s_cx, (lv_coord_t)(s_cy + 211) };
+    lv_draw_line(d, &ll, &h1, &h2);
+    lv_draw_line(d, &ll, &v1, &v2);
+}
+
+// =============================== sweep =======================================
+// A custom design's sweep is a live parameter set (color/leadColor/trailDeg/
+// opacity/length), not baked into the plate — it animates, so it has to stay a
+// real draw callback either way. Orb's plain grid has no sweep by default, but
+// a pushed design's own sweep.enabled should still apply regardless of theme.
+static inline float sweepLenPx()    { return customStyled() ? (float)theme_style::radar().sweepLength  : (float)RADAR_R_OUTER_PX; }
+static inline float sweepTrailDeg() { return customStyled() ? (float)theme_style::radar().sweepTrailDeg : SWEEP_TRAIL_DEG; }
+
+// Defined with the aircraft drawing below, used by the sweep's hub above it. Same
+// forward-declaration pattern apply_grid_visibility() already uses in this file.
+static void draw_glow(lv_draw_ctx_t *d, lv_point_t pos, float baseR, float glowPx, lv_color_t color);
+
+// The weather map's sweep. Its own object, its own colours, its own settings file.
+//
+// Written separately rather than by parameterising the Flight Tracker's, deliberately. The
+// scope's sweep is the one that took days to get smooth and is the one thing on this device
+// most worth not breaking; threading a second look through it to save thirty lines would
+// put that at risk for nothing. The two also diverge: no hub here, no aircraft, no
+// selection, and this one will grow its own image slot.
+//
+// What IS shared is the only thing that ever mattered for smoothness: s_sweepDeg, advanced
+// by real elapsed time in sweep_timer_cb, on a timer created once and never paused. Two
+// objects hang off that as easily as one when only one is ever visible.
+static void wx_sweep_draw_cb(lv_event_t *e) {
+    RADAR_PHASE(RP_WX);
+    const theme_style::Weather &ws = theme_style::weather();
+    if (!ws.sweepEnabled) return;
+    lv_draw_ctx_t *dctx = lv_event_get_draw_ctx(e);
+    const lv_point_t center = { s_cx, s_cy };
+    const float R = (float)(ws.sweepLength < 20 ? 20 : (ws.sweepLength > 233 ? 233 : ws.sweepLength));
+    const float trailDeg = (float)(ws.sweepTrailDeg < 1 ? 1 : (ws.sweepTrailDeg > 180 ? 180 : ws.sweepTrailDeg));
+    const float trailOpaMax = (float)ws.sweepOpacity * 2.55f;
+    // Clamped rather than trusted: a theme is a file on an SD card and a zero here would
+    // divide by zero two lines down.
+    const int steps = ws.sweepTrailSteps < 1 ? 1 : (ws.sweepTrailSteps > 60 ? 60 : ws.sweepTrailSteps);
+
+    lv_draw_line_dsc_t ld;
+    lv_draw_line_dsc_init(&ld);
+    ld.color = lv_color_hex(ws.sweepColor);
+    ld.width = (lv_coord_t)(ws.sweepTrailWidth < 1 ? 1 : ws.sweepTrailWidth);
+    ld.round_start = 1; ld.round_end = 1;
+    for (int i = steps; i >= 1; --i) {
+        const float frac = 1.0f - (float)i / (float)steps;
+        const float ang  = s_wxSweepDeg - (float)i * (trailDeg / (float)steps);
+        ld.opa = (lv_opa_t)(frac * frac * trailOpaMax);
+        if (ld.opa < 2) continue;
+        lv_point_t p2 = rim_point(ang, R);
+        lv_draw_line(dctx, &ld, &center, &p2);
+    }
+    lv_draw_line_dsc_t le;
+    lv_draw_line_dsc_init(&le);
+    le.color = lv_color_hex(ws.sweepLeadColor);
+    le.width = (lv_coord_t)(ws.sweepLeadWidth < 1 ? 1 : ws.sweepLeadWidth);
+    le.opa = 217;
+    le.round_start = 1; le.round_end = 1;
+    lv_point_t lead = rim_point(s_wxSweepDeg, R);
+    lv_draw_line(dctx, &le, &center, &lead);
+}
+
+static void sweep_draw_cb(lv_event_t *e) {
+    RADAR_PHASE(RP_SWEEP);
+    if (s_loadingPending) return;   // no hand until there is something to sweep over
+    if (!customStyled() && orb()) return;
+    if (customStyled() && !theme_style::radar().sweepEnabled) return;
+    // Image-type sweep is a separate rotating lv_img object (s_sweepImg, see
+    // init()/refreshCustomStyle()/sweep_timer_cb) — this vector wedge stays
+    // hidden/skipped whenever that's the active look.
+    if (customStyled() && theme_style::radar().sweepTypeImage) return;
+    lv_draw_ctx_t *dctx = lv_event_get_draw_ctx(e);
+    const lv_point_t center = { s_cx, s_cy };
+    const float R = sweepLenPx();
+    const float trailDeg = sweepTrailDeg();
+    const lv_color_t trailColor = customStyled() ? lv_color_hex(theme_style::radar().sweepColor) : s_cRing;
+    const lv_color_t leadColor  = customStyled() ? lv_color_hex(theme_style::radar().sweepLeadColor) : s_cLead;
+    const float trailOpaMax = customStyled() ? ((float)theme_style::radar().sweepOpacity * 2.55f) : (float)SWEEP_TRAIL_OPA;
+
+    // The trail's line work. Clamped rather than trusted: a theme is a file on an SD card
+    // and a zero step count here would divide by zero two lines down.
+    int steps = customStyled()
+        ? (theme_style::radar().sweepTrailSteps < 1 ? 1 : (theme_style::radar().sweepTrailSteps > 60 ? 60 : theme_style::radar().sweepTrailSteps))
+        : SWEEP_TRAIL_STEPS;
+    // Overridable over the cable, so the trade between how many lines the fan has and what
+    // a frame costs can be swept on a running Orb instead of reasoned about. Not persisted.
+    if (s_forceTrailSteps > 0) steps = s_forceTrailSteps;
+    lv_draw_line_dsc_t ld;
+    lv_draw_line_dsc_init(&ld);
+    ld.color = trailColor;
+    ld.width = customStyled() ? (lv_coord_t)theme_style::radar().sweepTrailWidth : 5;
+    ld.round_start = 1;
+    ld.round_end = 1;
+    for (int i = steps; i >= 1; --i) {
+        const float frac = 1.0f - (float)i / (float)steps;
+        const float ang  = s_sweepDeg - (float)i * (trailDeg / (float)steps);
+        ld.opa = (lv_opa_t)(frac * frac * trailOpaMax);
+        if (ld.opa < 2) continue;
+        lv_point_t p2 = rim_point(ang, R);
+        lv_draw_line(dctx, &ld, &center, &p2);
+    }
+    lv_draw_line_dsc_t le;
+    lv_draw_line_dsc_init(&le);
+    le.color = leadColor;
+    le.width = customStyled() ? (lv_coord_t)theme_style::radar().sweepLeadWidth : 2;
+    le.opa = 217;
+    le.round_start = 1;
+    le.round_end = 1;
+    lv_point_t lead = rim_point(s_sweepDeg, R);
+    lv_draw_line(dctx, &le, &center, &lead);
+
+    // The hub, last so it caps the lines rather than being crossed by them. Part of THIS
+    // layer on purpose: it is the point the hand turns about, so it belongs to the hand and
+    // moves with it through the stack. The aircraft layer's centre mark is a different
+    // thing that happens to sit in the same place.
+    if (customStyled()) {
+        const theme_style::Radar &rs = theme_style::radar();
+        if (rs.sweepHubOn && rs.sweepHubRadius > 0) {
+            const float hr = (float)rs.sweepHubRadius;
+            draw_glow(dctx, center, hr, (float)rs.sweepHubGlow, lv_color_hex(rs.sweepHubGlowColor));
+            lv_draw_rect_dsc_t hd;
+            lv_draw_rect_dsc_init(&hd);
+            hd.bg_color = lv_color_hex(rs.sweepHubColor);
+            hd.bg_opa = LV_OPA_COVER;
+            hd.radius = LV_RADIUS_CIRCLE;
+            lv_area_t ha = { (lv_coord_t)lroundf(center.x - hr), (lv_coord_t)lroundf(center.y - hr),
+                             (lv_coord_t)lroundf(center.x + hr), (lv_coord_t)lroundf(center.y + hr) };
+            lv_draw_rect(dctx, &hd, &ha);
+        }
+    }
+}
+
+// The rectangle a wedge of `trailDeg` ending at `deg` actually occupies, walked round the
+// arc rather than guessed at. The centre is always in it, because the wedge starts there.
+//
+// This is what keeps the sweep cheap: without it every step of the hand would mark all
+// 217,156 pixels as needing recomputing, when the hand covers a fraction of that. The
+// rectangle is bigger than the wedge (a diagonal wedge needs a much larger box than a
+// vertical one, since a box has to be axis-aligned), and it is still far smaller than the
+// screen at any angle.
+static void wedge_bbox_at(float deg, float trailDeg, float R, lv_area_t *out) {
+    lv_coord_t minx = s_cx, maxx = s_cx, miny = s_cy, maxy = s_cy;
+    const int steps = 10;
+    for (int i = 0; i <= steps; ++i) {
+        const float a = deg - trailDeg * (float)i / (float)steps;
+        const lv_point_t p = rim_point(a, R);
+        if (p.x < minx) minx = p.x;
+        if (p.x > maxx) maxx = p.x;
+        if (p.y < miny) miny = p.y;
+        if (p.y > maxy) maxy = p.y;
+    }
+    // Generous on purpose. Describing the changed region even slightly too small does not
+    // fail loudly: it leaves a smear of the previous hand behind, which looks like a fault
+    // in the artwork rather than in the invalidation.
+    const lv_coord_t pad = 6;
+    out->x1 = minx - pad; out->y1 = miny - pad;
+    out->x2 = maxx + pad; out->y2 = maxy + pad;
+}
+
+static void wedge_bbox(float deg, lv_area_t *out) {
+    wedge_bbox_at(deg, sweepTrailDeg(), sweepLenPx(), out);
+}
+
+// The same, for the weather map's sweep, which has its own trail, its own reach and its own
+// angle. Its geometry comes from the weather theme rather than the radar's: two apps.
+static void wx_wedge_bbox(float deg, lv_area_t *out) {
+    const theme_style::Weather &ws = theme_style::weather();
+    const float trailDeg = (float)(ws.sweepTrailDeg < 1 ? 1 : (ws.sweepTrailDeg > 180 ? 180 : ws.sweepTrailDeg));
+    const float R = (float)(ws.sweepLength < 20 ? 20 : (ws.sweepLength > 233 ? 233 : ws.sweepLength));
+    wedge_bbox_at(deg, trailDeg, R, out);
+}
+
+// Ask both sweeps to repaint just the ground their hands covered between the last frame and
+// this one.
+//
+// The weather map's was not being asked AT ALL on this path. The only invalidate it had sat
+// inside the image-sweep branch above, which returns early, so on the ordinary vector path
+// the weather sweep repainted only when a new radar frame happened to redraw the tile
+// underneath it. That is once a second against the timer's dozen, and it is why that hand
+// moved in steps while the Flight Tracker's did not.
+static void invalidate_sweeps(float prevDeg, float deg, float wxPrevDeg, float wxDeg) {
+    lv_area_t a, b, area;
+    if (s_sweep) {
+        wedge_bbox(prevDeg, &a);
+        wedge_bbox(deg, &b);
+        area.x1 = LV_MIN(a.x1, b.x1); area.y1 = LV_MIN(a.y1, b.y1);
+        area.x2 = LV_MAX(a.x2, b.x2); area.y2 = LV_MAX(a.y2, b.y2);
+        lv_obj_invalidate_area(s_sweep, &area);
+    }
+    // Invalidating an object on a tile that is not showing costs nothing: LVGL discards it.
+    if (s_wxSweep) {
+        wx_wedge_bbox(wxPrevDeg, &a);
+        wx_wedge_bbox(wxDeg, &b);
+        area.x1 = LV_MIN(a.x1, b.x1); area.y1 = LV_MIN(a.y1, b.y1);
+        area.x2 = LV_MAX(a.x2, b.x2); area.y2 = LV_MAX(a.y2, b.y2);
+        lv_obj_invalidate_area(s_wxSweep, &area);
+    }
+}
+
+// How far one aircraft's mark can reach from its own position, in px.
+//
+// blipSize describes the VECTOR shapes only. An image blip is drawn at the sprite's own
+// pixel size, about its pivot, so its reach is the distance from that pivot to the far
+// corner: a 100 px icon padded as if it were a 10 px dot leaves the invalidation area
+// short, and the glide smears the parts that fall outside it. Rotation is why the corner
+// matters rather than the edge, and an off-centre pivot is why both sides are measured.
+static inline int blip_reach(const theme_style::Radar &rs) {
+    if (rs.blipTypeImage) {
+        if (const lv_img_dsc_t *icon = radar_custom_blip_icon()) {
+            const int w = icon->header.w, h = icon->header.h;
+            const int bpx = rs.blipPivotX >= 0 ? rs.blipPivotX : CUSTOM_RADAR_BLIP_PIVOT_X;
+            const int bpy = rs.blipPivotY >= 0 ? rs.blipPivotY : CUSTOM_RADAR_BLIP_PIVOT_Y;
+            const float dx = (float)LV_MAX(bpx, w - bpx);
+            const float dy = (float)LV_MAX(bpy, h - bpy);
+            return (int)lroundf(sqrtf(dx * dx + dy * dy));
+        }
+    }
+    return rs.blipSize;
+}
+
+// glyph + label bounding box (for partial invalidation during the glide).
+// Must cover the label areas drawn in the aircraft layer (they grew for large-text mode).
+static inline lv_area_t glyph_bbox(lv_point_t p) {
+    lv_area_t a;
+    if (customStyled()) {
+        // No floating call/alt labels in custom style (those are the separate
+        // selection-banner system) — just cover the blip + its glow + the
+        // selection ring + its glow, generously, so the glide never trails ghosts.
+        const theme_style::Radar &rs = theme_style::radar();
+        const int pad = 16 + blip_reach(rs) + rs.blipGlow + rs.selDiameter / 2 + rs.selGlow;
+        a.x1 = p.x - pad; a.y1 = p.y - pad; a.x2 = p.x + pad; a.y2 = p.y + pad;
+    } else if (orb()) { a.x1 = p.x - 30; a.y1 = p.y - 30; a.x2 = p.x + 30;  a.y2 = p.y + 30; }
+    else          { a.x1 = p.x - 22; a.y1 = p.y - 22; a.x2 = p.x + 174; a.y2 = p.y + 32; }
+    return a;
+}
+static inline void area_union(lv_area_t &d, const lv_area_t &s) {
+    d.x1 = LV_MIN(d.x1, s.x1); d.y1 = LV_MIN(d.y1, s.y1);
+    d.x2 = LV_MAX(d.x2, s.x2); d.y2 = LV_MAX(d.y2, s.y2);
+}
+
+// Advance each glyph from its previous position toward the new target (ease-out),
+// invalidating only the small region each one occupies. Self-limiting: when a plane
+// barely moves (far away / slow), nx==pos and it's skipped — near-zero cost.
+static void interp_step(void) {
+#if MOTION_INTERP
+    if (!s_acLayer || s_acs.empty()) return;
+    // Positions still advance when nobody can see them; the REPAINT REQUESTS do not.
+    //
+    // That split is the lesson from the wind screen on 2026-09-04. A hidden object's
+    // invalidation is thrown away by LVGL, so asking for one costs only the asking, but the
+    // work of getting there is paid in full either way. Here that work is a bounding box per
+    // contact and a union per contact, with up to 28 of them, on a timer that runs on every
+    // screen the Orb has. Small next to the 655 ms the clock was spending, and free to stop.
+    //
+    // The position is NOT skipped, because it is state rather than drawing: it is a pure
+    // function of elapsed time, and a scope switched to mid-glide should show its aircraft
+    // where they are now, not where they were when somebody last looked.
+    const bool seen = lv_obj_is_visible(s_acLayer);
+    const uint32_t now = lv_tick_get();
+    int moved = 0; long pixels = 0;
+    float t = s_pollMs ? (float)(now - s_animStartMs) / (float)s_pollMs : 1.0f;
+    if (t > 1.0f) t = 1.0f;
+    // LINEAR, not eased. An ease-out is right for a thing arriving somewhere and stopping;
+    // an aircraft is not doing that. It is flying at a roughly constant speed, and the two
+    // endpoints of this interpolation are two real reports of where it was. Easing between
+    // them made it dart most of the way in the first half of the interval and then crawl,
+    // which reads as a lurch rather than as flight. Straight line, constant rate, arriving
+    // exactly as the next report does.
+    const float e = t;
+    for (AcDraw &ac : s_acs) {
+        const lv_coord_t nx = ac.from.x + (lv_coord_t)lroundf((float)(ac.to.x - ac.from.x) * e);
+        const lv_coord_t ny = ac.from.y + (lv_coord_t)lroundf((float)(ac.to.y - ac.from.y) * e);
+        if (nx == ac.pos.x && ny == ac.pos.y) continue;
+        ++moved;
+        pixels += labs((long)nx - ac.pos.x) + labs((long)ny - ac.pos.y);
+        lv_point_t np; np.x = nx; np.y = ny;
+        if (!seen) { ac.pos = np; continue; }
+        lv_area_t inv = glyph_bbox(ac.pos);
+        area_union(inv, glyph_bbox(np));
+        ac.pos = np;
+        lv_obj_invalidate_area(s_acLayer, &inv);
+    }
+#ifdef ARDUINO
+    // What the glyphs ACTUALLY did, so the question "does it look smooth" can be answered
+    // from here instead of by asking. Many small moves is a glide; one large move every ten
+    // seconds and nothing in between is a snap.
+    if (seen) {
+        static uint32_t at = 0; static int steps = 0, movers = 0; static long px = 0;
+        ++steps; movers += moved; px += pixels;
+        if (now - at > 5000) {
+            if (at) Serial.printf("[glide] %d steps in %lu ms, %d glyph moves, %ld px total\n",
+                                  steps, (unsigned long)(now - at), movers, px);
+            at = now; steps = 0; movers = 0; px = 0;
+        }
+    }
+#endif
+#endif
+}
+
+static void sweep_timer_cb(lv_timer_t *t) {
+    (void)t;
+    // Selection mode auto-times-out: 5s with no knob input drops back to the
+    // populated default view (deselect + release the knob) so the scope doesn't
+    // stay pinned on one aircraft. Runs before the early returns below.
+    if (s_selectMode && (uint32_t)(lv_tick_get() - s_selActivityMs) >= SELECT_IDLE_MS) radar_exit_select();
+    {   // aircraft glyph motion, throttled: see AC_INTERP_MS for why this is slow on purpose
+        static uint32_t s_lastInterpMs = 0;
+        const uint32_t nowIms = lv_tick_get();
+        const uint32_t gate = s_acInterpMs ? s_acInterpMs : (uint32_t)AC_INTERP_MS;
+        if (!s_lastInterpMs || (uint32_t)(nowIms - s_lastInterpMs) >= gate) {
+            s_lastInterpMs = nowIms;
+            interp_step();
+        }
+    }
+    if (!customStyled() && orb()) {
+        // animate the blip waves (invalidate only the ball areas)
+        s_wavePhase += 0.05f;
+        if (s_wavePhase >= 1.0f) s_wavePhase -= 1.0f;
+        if (!s_acLayer) return;
+        int balls = 0;
+        for (const AcDraw &ac : s_acs) {
+            if (!ac.inRange) continue;
+            if (balls >= ORB_BLIPS) break;
+            balls++;
+            lv_area_t a = { (lv_coord_t)(ac.pos.x - 44), (lv_coord_t)(ac.pos.y - 44),
+                            (lv_coord_t)(ac.pos.x + 44), (lv_coord_t)(ac.pos.y + 44) };
+            lv_obj_invalidate_area(s_acLayer, &a);
+        }
+        return;
+    }
+    // sweep disabled (live toggle, or the pushed design's own sweep.enabled): glyph interpolation above still runs
+    // (this used to read the compile-time CUSTOM_SWEEP_ENABLED/CUSTOM_SWEEP_SPEED
+    // macros directly — a leftover from before theme_style existed, so a theme
+    // switch could leave the sweep animating at a stale/wrong-theme speed even
+    // though sweep_draw_cb's own coloring/trail already followed theme_style)
+    if (!s_sweepEnabled || (customStyled() && !theme_style::radar().sweepEnabled)) return;
+    // Held still until the scope has data. Re-seeding the pacing state here means the
+    // first step after the wait is measured from the first real frame, not from the
+    // seconds-long projection stall that preceded it.
+    if (s_loadingPending) {
+        s_lastSweepMs = 0; s_emaDtMs = 0.0f;
+        // Repaint only when the displayed second actually changes: this timer fires every
+        // SWEEP_FRAME_MS (100 ms), and re-laying-out a label ten times a second for a number
+        // that only moves once a second would just be a different way to burn the frame
+        // budget this whole file exists to protect.
+        if (s_loadTicker) {
+            const int sec = (int)((lv_tick_get() - s_loadStartMs) / 1000U);
+            if (sec != s_loadShownSec) {
+                s_loadShownSec = sec;
+                char t[24];
+                snprintf(t, sizeof(t), "%ds", sec);
+                lv_label_set_text(s_loadTicker, t);
+                show(s_loadTicker, true);
+            }
+        }
+        return;
+    }
+    s_prevSweepDeg = s_sweepDeg;
+    const float speedDps = customStyled() ? (float)theme_style::radar().sweepSpeed : (360.0f * 1000.0f / (float)SWEEP_PERIOD_MS);
+    // Advance by REAL elapsed time, not by an assumed SWEEP_FRAME_MS per tick. LVGL
+    // timers fire when lv_timer_handler() reaches them, so on a loaded frame they run
+    // late; stepping a fixed amount each time made the sweep rotate at whatever fraction
+    // of real time the render loop was achieving. Measured 5 fps against a 33 fps target
+    // on Flight Tracker, which is exactly the "sweep is slower than Launch Kit shows"
+    // Zion spotted. Elapsed-time stepping makes the rotation correct at any frame rate
+    // (it just gets chunkier as frames drop, which is honest rather than wrong).
+    const uint32_t nowMs = lv_tick_get();
+    uint32_t dtMs = s_lastSweepMs ? (uint32_t)(nowMs - s_lastSweepMs) : (uint32_t)SWEEP_FRAME_MS;
+    s_lastSweepMs = nowMs;
+    // The RAW gap, kept before the clamp below touches it, because the clamp is a safety
+    // measure and a safety measure must never be what an instrument reads.
+    //
+    // This was one number doing both jobs and the statistics block below could therefore not
+    // see a single stall: every gap longer than half a second was written down as a perfect
+    // 100 ms. It reported 60 frames in a 15 second window, which is a real gap of 250 ms
+    // each, as min/avg/max 100/102/105. The instrument said the sweep was flawless while a
+    // third of its frames were arriving half a second late.
+    //
+    // It was blind to a real fault, too. On 2026-09-04 the clock was found redrawing its
+    // whole face under the wind screen, 655 ms once a second, which is exactly the stall
+    // this clamp was erasing from the record.
+    const uint32_t rawDtMs = dtMs;
+    if (dtMs > 500) dtMs = SWEEP_FRAME_MS;   // returning from a stall shouldn't teleport the sweep
+    // Advance by a SMOOTHED frame time, not the raw one. Raw elapsed-time stepping keeps
+    // the rotation speed exactly right, but when frame times wobble (66-100 ms on this
+    // hardware) the angular step wobbles with them, +-40%, and that variance IS the
+    // stutter the eye picks up. Zion's stated priority is explicit: perfectly even
+    // motion beats exactly correct speed. An EMA drifts the speed by a few percent
+    // while it adapts, which nobody can see; uneven steps are what everybody sees.
+    // Criterion for "the sweep must not look like it stutters": what the eye catches is not
+    // a low frame rate, it is UNEVEN steps. So measure the spread of frame times directly
+    // rather than trusting the average — 12 fps that arrives every 83 ms looks smooth, and
+    // 12 fps that arrives 40/120/60/140 does not, and both report the same fps.
+    // Only while somebody can actually see it. The question this number answers is whether
+    // the sweep looks smooth, and it looks like nothing at all when the scope is not on the
+    // glass. Sampling off-screen mixed the unloaded case into the figure and flattered it.
+    // Whichever sweep object this theme actually shows. A design with an image sweep hand
+    // HIDES s_sweep and shows s_sweepImg in its place, so testing s_sweep alone reported
+    // "not visible" on every such theme and the statistics never printed at all. Caught on
+    // the Steam Punk face within minutes of shipping it, which is the argument for reading
+    // the visible object rather than the one that happens to be first in the file.
+    lv_obj_t *shown = (customStyled() && theme_style::radar().sweepTypeImage) ? s_sweepImg : s_sweep;
+    if (shown && lv_obj_is_visible(shown)) {
+        static uint32_t s_jMin = 0xFFFFFFFF, s_jMax = 0, s_jAt = 0, s_jN = 0, s_jSum = 0, s_jStall = 0;
+        if (rawDtMs < s_jMin) s_jMin = rawDtMs;
+        if (rawDtMs > s_jMax) s_jMax = rawDtMs;
+        if (rawDtMs > 500) ++s_jStall;
+        s_jSum += rawDtMs; ++s_jN;
+        if (lv_tick_get() - s_jAt > 15000) {
+            if (s_jAt && s_jN) {
+                const uint32_t avg = s_jSum / s_jN;
+                // Stalls counted separately as well as included in max, because one stall and
+                // twenty read the same in a maximum and mean completely different things.
+                Serial.printf("[sweep] frames=%lu dt min/avg/max=%lu/%lu/%lu ms spread=%lu ms, %lu stalled\n",
+                              (unsigned long)s_jN, (unsigned long)s_jMin,
+                              (unsigned long)avg, (unsigned long)s_jMax,
+                              (unsigned long)(s_jMax - s_jMin), (unsigned long)s_jStall);
+            }
+            s_jAt = lv_tick_get(); s_jMin = 0xFFFFFFFF; s_jMax = 0; s_jN = 0; s_jSum = 0; s_jStall = 0;
+        }
+    }
+    // ASK FOR AS MANY FRAMES AS THE SCREEN CAN ACTUALLY DRAW.
+    //
+    // SWEEP_FRAME_MS is 100 and it was measured honestly, on a design whose frame cost 166 ms.
+    // Zion's Modern dial costs about a quarter of that — its trail is ONE line, so the fan
+    // this file spends most of its worry on is not even in play — and the sweep was still
+    // being asked for ten frames a second while the device had room for three times as many.
+    // Ten a second is a sweep moving three degrees a step, which is the stutter.
+    //
+    // Measured off the WORK, never off the gap. Two earlier attempts fed an EMA of the
+    // measured interval back into the period; a gap can never be shorter than the period, so
+    // that can only ever push it up, and both walked to their ceiling. lvgl_us divided by
+    // frames is time spent rendering per screen frame, which does not depend on how often
+    // the sweep asks — each frame draws it once either way.
+    //
+    // Half as much again as the work, so the timer rather than the renderer decides when
+    // frames happen, which is this file's own rule about even arrival.
+    //
+    // Device only: display.cpp is not built for the simulator, where these counters do not
+    // exist and a desktop's frame time would say nothing about an ESP32's anyway.
+#ifdef ARDUINO
+    {
+        static uint32_t lastUs = 0, lastFrames = 0, asked = 0;
+        static float ema = 0.0f;
+        // Forget the last design's measurement rather than adapt away from it. A theme
+        // change reboots the Orb, so this only matters for a live style refresh, but the
+        // guarantee is worth making plainly: nothing about how often this screen redraws is
+        // ever carried from one design to another, or stored with one.
+        if (s_pacingStale) { s_pacingStale = false; lastUs = 0; lastFrames = 0; asked = 0; ema = 0.0f; }
+        const uint32_t us = display_lvgl_us(), fr = display_frames();
+        if (lastFrames && fr > lastFrames) {
+            const float perFrame = (float)(us - lastUs) / (float)(fr - lastFrames) / 1000.0f;
+            if (perFrame > 0.5f && perFrame < 400.0f)
+                ema = (ema <= 0.0f) ? perFrame : ema + 0.15f * (perFrame - ema);
+        }
+        lastUs = us; lastFrames = fr;
+        if (ema > 0.0f) {
+            uint32_t want = (uint32_t)(ema * 1.5f + 0.5f);
+            // 40 ms is the floor on purpose. A sweep is a slow hand; past 25 a second the
+            // extra frames buy nothing an eye can see and cost the whole screen.
+            if (want < 40) want = 40;
+            if (want > 200) want = 200;
+            if (s_timer && (asked == 0 || want > asked + 6 || want + 6 < asked)) {
+                asked = want;
+                lv_timer_set_period(s_timer, want);
+            }
+        }
+    }
+#endif
+    if (s_emaDtMs <= 0.0f) s_emaDtMs = (float)dtMs;
+    s_emaDtMs += 0.08f * ((float)dtMs - s_emaDtMs);
+    if (s_emaDtMs < 20.0f) s_emaDtMs = 20.0f;
+    if (s_emaDtMs > 400.0f) s_emaDtMs = 400.0f;
+    s_sweepDeg += speedDps * s_emaDtMs / 1000.0f;
+    {
+        // The same smoothed dt, so it cannot judder independently of the other one.
+        const theme_style::Weather &ws = theme_style::weather();
+        const float wxDps = (float)(ws.sweepSpeed < 1 ? 1 : (ws.sweepSpeed > 360 ? 360 : ws.sweepSpeed));
+        s_wxPrevSweepDeg = s_wxSweepDeg;
+        s_wxSweepDeg += wxDps * s_emaDtMs / 1000.0f;
+        if (s_wxSweepDeg >= 360.0f) s_wxSweepDeg -= 360.0f;
+    }
+    if (s_sweepDeg >= 360.0f) s_sweepDeg -= 360.0f;
+    // Image-type sweep: same angle, rotated as a real lv_img instead of the
+    // vector wedge's manual bounding-box invalidation below.
+    if (customStyled() && theme_style::radar().sweepTypeImage) {
+        if (s_sweepImg) lv_img_set_angle(s_sweepImg, (int16_t)lroundf(s_sweepDeg * 10.0f));
+        // The Flight Tracker's hand is an image here and LVGL handles its own invalidation
+        // for a rotation. The weather map's is a vector wedge either way, so it gets the
+        // same box treatment as on the path below rather than a whole-screen repaint.
+        invalidate_sweeps(s_sweepDeg, s_sweepDeg, s_wxPrevSweepDeg, s_wxSweepDeg);
+        return;
+    }
+    invalidate_sweeps(s_prevSweepDeg, s_sweepDeg, s_wxPrevSweepDeg, s_wxSweepDeg);
+}
+
+// =============================== aircraft ====================================
+// Is this point inside a theme's exclusion zone? See theme_style::Radar::zones for why
+// these exist: they let decoration sit in the free baked background instead of in an
+// expensive layer above the aircraft. Cheap enough to call per point per frame — at most
+// six squared-distance comparisons, no square roots.
+static inline bool in_excluded_zone(lv_coord_t x, lv_coord_t y) {
+    if (!customStyled()) return false;
+    const theme_style::Radar &rs = theme_style::radar();
+    for (int i = 0; i < rs.zoneCount; ++i) {
+        const theme_style::Radar::Zone &z = rs.zones[i];
+        bool inside;
+        if (z.rect) {
+            const long dx = (long)x - z.x, dy = (long)y - z.y;
+            inside = (dx >= -(z.w / 2) && dx <= z.w / 2 && dy >= -(z.h / 2) && dy <= z.h / 2);
+        } else {
+            const long dx = (long)x - z.x, dy = (long)y - z.y;
+            inside = (dx * dx + dy * dy <= (long)z.r * z.r);
+        }
+        // Inverted zones hide everything OUTSIDE the shape, which is how one big circle
+        // becomes a containment ring keeping aircraft off the dial's border.
+        if (inside != z.invert) return true;
+    }
+    return false;
+}
+static inline bool ac_masked(const AcDraw &ac) { return in_excluded_zone(ac.pos.x, ac.pos.y); }
+
+// The SWEEP IS NEVER MASKED, by decision (Zion, 2026-08-18), and this is not an oversight
+// to be tidied up later. It is the one moving part of the instrument, and a hand that
+// blinks out over a piece of artwork reads as a fault rather than as a design. Where a
+// sweep needs to stop short of a border, sweepLength already does that honestly, by making
+// the hand shorter rather than by hiding part of it.
+//
+// Masked, by contrast: aircraft and their off-range arrows, their trails and flow tracks,
+// the rings and crosshair (baked into the plate by the editors), and the etched map.
+
+static void draw_trail(lv_draw_ctx_t *d, const AcDraw &ac, lv_color_t col) {
+    const int n = (int)ac.trail.size();
+    if (n < 2) return;
+    lv_draw_line_dsc_t t;
+    lv_draw_line_dsc_init(&t);
+    t.color = col;
+    t.width = 2;
+    for (int i = 1; i < n; ++i) {
+        t.opa = (lv_opa_t)(10 + 45 * i / n);
+        lv_point_t a = ac.trail[i - 1], b = ac.trail[i];
+        // Hiding the aircraft but still drawing its track across the decoration would
+        // defeat the point, so a segment is dropped if either end sits in a zone.
+        if (in_excluded_zone(a.x, a.y) || in_excluded_zone(b.x, b.y)) continue;
+        lv_draw_line(d, &t, &a, &b);
+    }
+}
+
+static void draw_ball(lv_draw_ctx_t *d, const AcDraw &ac) {
+    // emitted waves: several expanding rings (sonar-ping look)
+    lv_draw_arc_dsc_t w;
+    lv_draw_arc_dsc_init(&w);
+    w.color = ORB_ACCENT;
+    w.width = 3;
+    for (int wv = 0; wv < 3; ++wv) {
+        float ph = s_wavePhase + (float)wv * 0.34f;
+        if (ph >= 1.0f) ph -= 1.0f;
+        w.opa = scale_opa((lv_opa_t)((1.0f - ph) * 245.0f), ac.freshness);
+        if (w.opa > 6) lv_draw_arc(d, &w, &ac.pos, (uint16_t)(BALL_R + 3 + ph * WAVE_EXPAND), 0, 360);
+    }
+
+    // the ball
+    lv_draw_rect_dsc_t b;
+    lv_draw_rect_dsc_init(&b);
+    b.bg_color = ac.emergency ? ORB_EMERG : ORB_BLIP;
+    b.bg_opa = scale_opa(LV_OPA_COVER, ac.freshness);
+    b.radius = LV_RADIUS_CIRCLE;
+    b.border_color = lv_color_hex(0x7A5A00);
+    b.border_width = 1;
+    b.border_opa = scale_opa(150, ac.freshness);
+    lv_area_t r = { (lv_coord_t)(ac.pos.x - BALL_R), (lv_coord_t)(ac.pos.y - BALL_R),
+                    (lv_coord_t)(ac.pos.x + BALL_R), (lv_coord_t)(ac.pos.y + BALL_R) };
+    lv_draw_rect(d, &b, &r);
+
+    // glossy highlight
+    lv_draw_rect_dsc_t hl;
+    lv_draw_rect_dsc_init(&hl);
+    hl.bg_color = lv_color_hex(0xFFFBCC);
+    hl.bg_opa = scale_opa(170, ac.freshness);
+    hl.radius = LV_RADIUS_CIRCLE;
+    lv_area_t hr = { (lv_coord_t)(ac.pos.x - 5), (lv_coord_t)(ac.pos.y - 6),
+                     (lv_coord_t)(ac.pos.x - 1), (lv_coord_t)(ac.pos.y - 2) };
+    lv_draw_rect(d, &hl, &hr);
+}
+
+static void draw_offrange(lv_draw_ctx_t *d, const AcDraw &ac) {
+    // small ball at the rim
+    lv_draw_rect_dsc_t b;
+    lv_draw_rect_dsc_init(&b);
+    b.bg_color = ac.emergency ? ORB_EMERG : ORB_BLIP;
+    b.bg_opa = scale_opa(LV_OPA_COVER, ac.freshness);
+    b.radius = LV_RADIUS_CIRCLE;
+    lv_area_t r = { (lv_coord_t)(ac.pos.x - 5), (lv_coord_t)(ac.pos.y - 5),
+                    (lv_coord_t)(ac.pos.x + 5), (lv_coord_t)(ac.pos.y + 5) };
+    lv_draw_rect(d, &b, &r);
+
+    // small orange triangle just outside it, pointing toward the aircraft's bearing
+    const lv_coord_t ox = (lv_coord_t)lroundf(ac.pos.x + 12.0f * sinf(ac.bearingDeg * (float)M_PI / 180.0f));
+    const lv_coord_t oy = (lv_coord_t)lroundf(ac.pos.y - 12.0f * cosf(ac.bearingDeg * (float)M_PI / 180.0f));
+    lv_point_t tri[3] = { rot_pt(0, -7, ac.bearingDeg, ox, oy),
+                          rot_pt(5, 4, ac.bearingDeg, ox, oy),
+                          rot_pt(-5, 4, ac.bearingDeg, ox, oy) };
+    lv_draw_rect_dsc_t td;
+    lv_draw_rect_dsc_init(&td);
+    td.bg_color = ORB_ACCENT;
+    td.bg_opa = scale_opa(LV_OPA_COVER, ac.freshness);
+    lv_draw_polygon(d, &td, tri, 3);
+}
+
+// Approximate a canvas shadowBlur glow: concentric filled circles behind the
+// real shape, opacity falling off with radius — the same "soft ring" trick
+// draw_ball's wave animation and the sweep's fading trail already use.
+static void draw_glow(lv_draw_ctx_t *d, lv_point_t pos, float baseR, float glowPx, lv_color_t color) {
+    if (glowPx <= 0.5f) return;
+    const int steps = 5;
+    lv_draw_rect_dsc_t g;
+    lv_draw_rect_dsc_init(&g);
+    g.bg_color = color;
+    g.radius = LV_RADIUS_CIRCLE;
+    for (int i = steps; i >= 1; --i) {
+        const float t = (float)i / (float)steps;
+        const float r = baseR + glowPx * t;
+        const lv_opa_t opa = (lv_opa_t)((1.0f - t) * (1.0f - t) * 130.0f);
+        if (opa < 3) continue;
+        g.bg_opa = opa;
+        lv_area_t a = { (lv_coord_t)lroundf(pos.x - r), (lv_coord_t)lroundf(pos.y - r),
+                        (lv_coord_t)lroundf(pos.x + r), (lv_coord_t)lroundf(pos.y + r) };
+        lv_draw_rect(d, &g, &a);
+    }
+}
+
+// Mirrors the editor's radarKitePoints(): kite=0 is today's notched kite (a
+// tail), kite=1 collapses the notch flush with the wings into a plain triangle.
+static inline void custom_kite_points(float kite, float *gx, float *gy) {
+    const float t = kite < 0.0f ? 0.0f : (kite > 1.0f ? 1.0f : kite);
+    const float notchY = 8.0f - 3.0f * t;
+    gx[0] = 0.0f; gx[1] = 7.0f; gx[2] = 0.0f; gx[3] = -7.0f;
+    gy[0] = -11.0f; gy[1] = 5.0f; gy[2] = notchY; gy[3] = 5.0f;
+}
+
+// A pushed design's own blip/selection/off-range/center look, used for every
+// theme once a design is active (replaces both Orb's ball-with-waves and the
+// phosphor kite/triangle paths below). Trails stay on regardless of style —
+// the editor has no live data to preview motion history with, but it's a
+// harmless, useful device-only extra, not a visual regression from the design.
+// Phase 0 instrumentation for Flight Tracker. Every aircraft on screen gets its icon
+// rotated to heading with antialiasing on, which is the most expensive primitive LVGL
+// has, and there can be two dozen of them. Print the real cost before optimising it:
+// the alternative is pre-rotating the icon into cached bitmaps, which is real work and
+// should not be built on an estimate.
+static void draw_custom_ac(lv_draw_ctx_t *d) {
+#ifdef ARDUINO
+    const uint32_t t_ac0 = micros();
+    int acDrawn = 0;
+#endif
+    const theme_style::Radar &rs = theme_style::radar();
+    for (const AcDraw &ac : s_acs) {
+        // Masked by an exclusion zone: draw nothing for it at all, icon or off-range
+        // arrow. It reappears the moment it clears the far side.
+        if (ac_masked(ac)) continue;
+        if (!ac.inRange) {
+            if (!rs.offRangeEnabled) continue;
+            const lv_color_t oc = lv_color_hex(rs.offRangeColor);
+            lv_draw_rect_dsc_t b;
+            lv_draw_rect_dsc_init(&b);
+            b.bg_color = oc; b.bg_opa = scale_opa(LV_OPA_COVER, ac.freshness); b.radius = LV_RADIUS_CIRCLE;
+            const lv_coord_t sz = (lv_coord_t)rs.offRangeSize;
+            lv_area_t r = { (lv_coord_t)(ac.pos.x - sz), (lv_coord_t)(ac.pos.y - sz),
+                            (lv_coord_t)(ac.pos.x + sz), (lv_coord_t)(ac.pos.y + sz) };
+            lv_draw_rect(d, &b, &r);
+            const lv_coord_t ox = (lv_coord_t)lroundf(ac.pos.x + 12.0f * sinf(ac.bearingDeg * (float)M_PI / 180.0f));
+            const lv_coord_t oy = (lv_coord_t)lroundf(ac.pos.y - 12.0f * cosf(ac.bearingDeg * (float)M_PI / 180.0f));
+            lv_point_t tri[3] = { rot_pt(0, -7, ac.bearingDeg, ox, oy),
+                                  rot_pt(5, 4, ac.bearingDeg, ox, oy),
+                                  rot_pt(-5, 4, ac.bearingDeg, ox, oy) };
+            lv_draw_rect_dsc_t td;
+            lv_draw_rect_dsc_init(&td);
+            td.bg_color = oc; td.bg_opa = scale_opa(LV_OPA_COVER, ac.freshness);
+            lv_draw_polygon(d, &td, tri, 3);
+            continue;
+        }
+
+        draw_trail(d, ac, ac.color);
+
+        lv_color_t blipColor;
+        if (rs.blipFixedColorMode) {
+            blipColor = lv_color_hex(rs.blipFixedColor);
+        } else {
+            if (ac.onGround)           blipColor = lv_color_hex(rs.blipAltGround);
+            else if (ac.altFt < 3000)  blipColor = lv_color_hex(rs.blipAltLow);
+            else if (ac.altFt < 10000) blipColor = lv_color_hex(rs.blipAltMid);
+            else if (ac.altFt < 20000) blipColor = lv_color_hex(rs.blipAltHigh);
+            else if (ac.altFt < 30000) blipColor = lv_color_hex(rs.blipAltCruise);
+            else                       blipColor = lv_color_hex(rs.blipAltJet);
+        }
+        // Selection style 1 (Glow) / 2 (Recolor) change the selected aircraft's
+        // OWN icon draw below instead of adding a separate ring — style 0
+        // (Ring, the original/default look) leaves blipColor/glow untouched
+        // here and draws the ring afterward, exactly as before this field existed.
+        const bool isSelected = rs.selEnabled && !s_selHex.empty() && s_selHex == ac.hex;
+        if (isSelected && rs.selStyle == 2) blipColor = lv_color_hex(rs.selColor);
+        // The blip icon itself (dot/kite/image) — off-range arrow and
+        // selection ring below have their own separate enabled toggles.
+        if (rs.blipEnabled) {
+#ifdef ARDUINO
+        ++acDrawn;
+#endif
+        // Selection style 1 (Glow): boost this aircraft's own glow to at
+        // least a visible amount (a 0 selGlow default would otherwise be
+        // invisible the moment you switch to Glow) using the selection's
+        // color, same "boost the blip's own draw" approach the editor
+        // preview uses (see drawBlipImage/drawBlipVector in app.js).
+        float selBlipGlowAmt = (float)rs.blipGlow;
+        lv_color_t selBlipGlowColor = lv_color_hex(rs.blipGlowColor);
+        if (isSelected && rs.selStyle == 1) {
+            const float boosted = rs.selGlow > 0 ? (float)rs.selGlow : 18.0f;
+            if (boosted > selBlipGlowAmt) selBlipGlowAmt = boosted;
+            selBlipGlowColor = lv_color_hex(rs.selGlowColor);
+        }
+        draw_glow(d, ac.pos, (float)rs.blipSize, selBlipGlowAmt * ac.freshness, selBlipGlowColor);
+
+        if (rs.blipTypeImage) {
+            // The uploaded aircraft icon, rotated to heading and (optionally) recolored
+            // by altitude band via LVGL's own image recolor mix — the icon's alpha was
+            // already derived from its Blend mode client-side (see exportRadarLayers'
+            // blipIcon step), so this is always a plain alpha-over rotate here, no
+            // blend-mode handling needed at draw time. Pivot/icon bitmap themselves
+            // stay compile-time (coupled to whichever icon PNG is actually baked in —
+            // see theme_style.h) — only color/size/tint travel per theme here.
+            if (const lv_img_dsc_t *icon = radar_custom_blip_icon()) {
+                // "Rotate to heading" off: the icon always shows at its own
+                // baseline angle, it just moves with the aircraft's position.
+                const float headingDeg = rs.blipRotate ? ((ac.track != ac.track) ? 0.0f : ac.track) : 0.0f;
+                lv_draw_img_dsc_t idsc;
+                lv_draw_img_dsc_init(&idsc);
+                idsc.angle = (int16_t)lroundf((headingDeg + CUSTOM_BLIP_IMAGE_BASELINE_DEG) * 10.0f);
+                // Theme data first, welded macro as the fallback. A theme that ships its
+                // own blip sprite has to be able to say where that sprite turns.
+                const int bpx = rs.blipPivotX >= 0 ? rs.blipPivotX : CUSTOM_RADAR_BLIP_PIVOT_X;
+                const int bpy = rs.blipPivotY >= 0 ? rs.blipPivotY : CUSTOM_RADAR_BLIP_PIVOT_Y;
+                idsc.pivot.x = bpx;
+                idsc.pivot.y = bpy;
+                idsc.opa = scale_opa(LV_OPA_COVER, ac.freshness);
+                idsc.antialias = 1;
+                // Selection style 2 (Recolor) forces the tint on for this one
+                // aircraft even if the design normally leaves the icon
+                // untinted — blipColor is already overridden to selColor
+                // above, so this recolors it, same as the editor preview.
+                if (rs.blipImageTint || (isSelected && rs.selStyle == 2)) {
+                    idsc.recolor = blipColor;
+                    idsc.recolor_opa = LV_OPA_COVER;
+                }
+                const lv_coord_t x0 = (lv_coord_t)(ac.pos.x - bpx);
+                const lv_coord_t y0 = (lv_coord_t)(ac.pos.y - bpy);
+                lv_area_t r = { x0, y0, (lv_coord_t)(x0 + icon->header.w - 1), (lv_coord_t)(y0 + icon->header.h - 1) };
+                lv_draw_img(d, &idsc, &r, icon);
+            } else {
+                // Design says "image" but nothing decoded (no icon uploaded, or the SD/
+                // flash asset failed) — fall back to the plain dot so a blip is never
+                // silently invisible.
+                lv_draw_rect_dsc_t g;
+                lv_draw_rect_dsc_init(&g);
+                g.bg_color = blipColor; g.bg_opa = scale_opa(LV_OPA_COVER, ac.freshness); g.radius = LV_RADIUS_CIRCLE;
+                const lv_coord_t sz = (lv_coord_t)rs.blipSize;
+                lv_area_t r = { (lv_coord_t)(ac.pos.x - sz), (lv_coord_t)(ac.pos.y - sz),
+                                (lv_coord_t)(ac.pos.x + sz), (lv_coord_t)(ac.pos.y + sz) };
+                lv_draw_rect(d, &g, &r);
+            }
+        } else if (rs.blipKiteShape) {
+            const float th = (rs.blipRotate ? ((ac.track != ac.track) ? 0.0f : ac.track) : 0.0f) * (float)M_PI / 180.0f;
+            const float cth = cosf(th), sth = sinf(th);
+            float gx[4], gy[4];
+            custom_kite_points((float)rs.blipKiteT / 100.0f, gx, gy);
+            const float scale = (float)rs.blipSize / 9.0f;
+            lv_point_t pts[4];
+            for (int i = 0; i < 4; ++i) {
+                const float x = (gx[i] * scale) * cth - (gy[i] * scale) * sth;
+                const float y = (gx[i] * scale) * sth + (gy[i] * scale) * cth;
+                pts[i].x = (lv_coord_t)(ac.pos.x + (lv_coord_t)lroundf(x));
+                pts[i].y = (lv_coord_t)(ac.pos.y + (lv_coord_t)lroundf(y));
+            }
+            lv_draw_rect_dsc_t g;
+            lv_draw_rect_dsc_init(&g);
+            g.bg_color = blipColor; g.bg_opa = scale_opa(LV_OPA_COVER, ac.freshness);
+            lv_draw_polygon(d, &g, pts, 4);
+        } else {
+            lv_draw_rect_dsc_t g;
+            lv_draw_rect_dsc_init(&g);
+            g.bg_color = blipColor; g.bg_opa = scale_opa(LV_OPA_COVER, ac.freshness); g.radius = LV_RADIUS_CIRCLE;
+            const lv_coord_t sz = (lv_coord_t)rs.blipSize;
+            lv_area_t r = { (lv_coord_t)(ac.pos.x - sz), (lv_coord_t)(ac.pos.y - sz),
+                            (lv_coord_t)(ac.pos.x + sz), (lv_coord_t)(ac.pos.y + sz) };
+            lv_draw_rect(d, &g, &r);
+        }
+        } // rs.blipEnabled
+
+        if (isSelected && rs.selStyle == 0) {
+            draw_glow(d, ac.pos, (float)rs.selDiameter / 2.0f, (float)rs.selGlow, lv_color_hex(rs.selGlowColor));
+            lv_draw_arc_dsc_t sr;
+            lv_draw_arc_dsc_init(&sr);
+            sr.color = lv_color_hex(rs.selColor); sr.width = rs.selWidth; sr.opa = 240;
+            lv_draw_arc(d, &sr, &ac.pos, (uint16_t)(rs.selDiameter / 2), 0, 360);
+        }
+    }
+
+    // Center marker, drawn last so it sits over every blip — matches the editor's z-order.
+    if (rs.centerEnabled) {
+        lv_draw_rect_dsc_t cd;
+        lv_draw_rect_dsc_init(&cd);
+        cd.bg_color = lv_color_hex(rs.centerColor); cd.bg_opa = LV_OPA_COVER; cd.radius = LV_RADIUS_CIRCLE;
+        lv_area_t cr = { (lv_coord_t)(s_cx - rs.centerRadius), (lv_coord_t)(s_cy - rs.centerRadius),
+                         (lv_coord_t)(s_cx + rs.centerRadius), (lv_coord_t)(s_cy + rs.centerRadius) };
+        lv_draw_rect(d, &cd, &cr);
+        lv_draw_rect_dsc_t ci;
+        lv_draw_rect_dsc_init(&ci);
+        ci.bg_color = lv_color_hex(rs.centerInnerColor); ci.bg_opa = LV_OPA_COVER; ci.radius = LV_RADIUS_CIRCLE;
+        lv_area_t cir = { (lv_coord_t)(s_cx - rs.centerInnerRadius), (lv_coord_t)(s_cy - rs.centerInnerRadius),
+                          (lv_coord_t)(s_cx + rs.centerInnerRadius), (lv_coord_t)(s_cy + rs.centerInnerRadius) };
+        lv_draw_rect(d, &ci, &cir);
+    }
+#ifdef ARDUINO
+    {   // Rate-limited: this runs every frame and the log itself must not become the cost.
+        static uint32_t s_lastLog = 0;
+        const uint32_t now = millis();
+        if (now - s_lastLog > 2000) {
+            s_lastLog = now;
+            Serial.printf("[perf] radar aircraft draw: %lu us for %d aircraft (%s icons)\n",
+                          (unsigned long)(micros() - t_ac0), acDrawn,
+                          rs.blipTypeImage ? (rs.blipRotate ? "rotated image" : "image, no rotate")
+                                           : "vector");
+        }
+    }
+#endif
+}
+
+static void ac_draw_cb(lv_event_t *e) {
+    RADAR_PHASE(RP_AC);
+    // Once per frame, and on THIS layer rather than the grid: a custom design bakes its
+    // rings into the plate, so the grid layer is never drawn and the report never spoke.
+    radar_phase_report();
+    lv_draw_ctx_t *d = lv_event_get_draw_ctx(e);
+    if (customStyled()) { draw_custom_ac(d); return; }
+    const bool drg = orb();
+    int balls = 0, arrows = 0;
+
+    for (const AcDraw &ac : s_acs) {
+        if (ac_masked(ac)) continue;   // exclusion zones apply to the stock scopes too
+        if (drg) {
+            if (ac.inRange) {
+                if (balls >= ORB_BLIPS) continue;   // up to 7 in-range balls
+                draw_trail(d, ac, ORB_FLOW);
+                draw_ball(d, ac);
+                balls++;
+            } else {
+                if (arrows >= ORB_ARROWS) continue;  // up to 8 off-range arrows
+                draw_offrange(d, ac);
+                arrows++;
+            }
+        } else {
+            if (!ac.inRange) continue;            // phosphor shows in-range traffic only
+            draw_trail(d, ac, ac.color);
+            const float th = ((ac.track != ac.track) ? 0.0f : ac.track) * (float)M_PI / 180.0f;
+            const float c = cosf(th), s = sinf(th);
+            const float *gx = GX, *gy = GY;
+            if (aviator()) {                     // little bombers vs little fighters (both convex kites)
+                if (is_big_type(ac.type)) { gx = BOMBER_X;  gy = BOMBER_Y; }
+                else                      { gx = FIGHTER_X; gy = FIGHTER_Y; }
+            }
+            lv_point_t pts[4];
+            for (int i = 0; i < 4; ++i) {
+                const float x = gx[i] * c - gy[i] * s;
+                const float y = gx[i] * s + gy[i] * c;
+                pts[i].x = (lv_coord_t)(ac.pos.x + (lv_coord_t)lroundf(x));
+                pts[i].y = (lv_coord_t)(ac.pos.y + (lv_coord_t)lroundf(y));
+            }
+            lv_draw_rect_dsc_t g;
+            lv_draw_rect_dsc_init(&g);
+            g.bg_color = ac.color;
+            g.bg_opa = scale_opa(LV_OPA_COVER, ac.freshness);
+            lv_draw_polygon(d, &g, pts, 4);
+            if (ac.emergency) {
+                lv_draw_arc_dsc_t h;
+                lv_draw_arc_dsc_init(&h);
+                h.color = COL_EMERG; h.width = 2; h.opa = scale_opa(200, ac.freshness);
+                lv_draw_arc(d, &h, &ac.pos, 16, 0, 360);
+            }
+        }
+
+        // selection ring(s)
+        if (!s_selHex.empty() && s_selHex == ac.hex) {
+            lv_draw_arc_dsc_t sr;
+            lv_draw_arc_dsc_init(&sr);
+            sr.width = 2;
+            sr.opa = 240;
+            if (drg) {
+                sr.color = ORB_ACCENT;
+                lv_draw_arc(d, &sr, &ac.pos, 15, 0, 360);
+                lv_draw_arc(d, &sr, &ac.pos, 23, 0, 360);
+            } else {
+                sr.color = ac.emergency ? COL_EMERG : s_cInk;
+                lv_draw_arc(d, &sr, &ac.pos, 19, 0, 360);
+            }
+        }
+
+        // floating labels (phosphor only; orb keeps clean balls + the tap card)
+        if (!drg) {
+            lv_draw_label_dsc_t lc;
+            lv_draw_label_dsc_init(&lc);
+            lc.font = s_bigText ? &lv_font_montserrat_18 : &lv_font_montserrat_14;
+            lc.color = s_cInk;
+            lv_area_t a1 = { (lv_coord_t)(ac.pos.x + 12), (lv_coord_t)(ac.pos.y - 14),
+                             (lv_coord_t)(ac.pos.x + 168), (lv_coord_t)(ac.pos.y + 4) };
+            if (ac.call[0]) lv_draw_label(d, &lc, &a1, ac.call, NULL);
+            lv_draw_label_dsc_t la;
+            lv_draw_label_dsc_init(&la);
+            la.font = s_bigText ? &lv_font_montserrat_16 : &lv_font_montserrat_12;
+            la.color = ac.color;
+            lv_area_t a2 = { a1.x1, (lv_coord_t)(ac.pos.y + 4), a1.x2, (lv_coord_t)(ac.pos.y + 26) };
+            if (ac.altTxt[0]) lv_draw_label(d, &la, &a2, ac.altTxt, NULL);
+        }
+    }
+}
+
+// =============================== helpers =====================================
+static lv_obj_t *make_label(lv_obj_t *parent, const char *txt, const lv_font_t *font,
+                            lv_color_t color, lv_align_t align, lv_coord_t dx, lv_coord_t dy) {
+    lv_obj_t *l = lv_label_create(parent);
+    lv_label_set_text(l, txt);
+    lv_obj_set_style_text_font(l, font, 0);
+    lv_obj_set_style_text_color(l, color, 0);
+    lv_obj_align(l, align, dx, dy);
+    return l;
+}
+
+static lv_obj_t *make_layer(lv_obj_t *parent, lv_event_cb_t draw_cb) {
+    lv_obj_t *o = lv_obj_create(parent);
+    lv_obj_remove_style_all(o);
+    lv_obj_set_size(o, SCREEN_W, SCREEN_H);
+    lv_obj_center(o);
+    lv_obj_clear_flag(o, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+    if (draw_cb) lv_obj_add_event_cb(o, draw_cb, LV_EVENT_DRAW_MAIN, nullptr);
+    return o;
+}
+
+static void pulse_anim_cb(void *obj, int32_t v) {
+    lv_obj_t *o = (lv_obj_t *)obj;
+    const lv_coord_t dia = 10 + (lv_coord_t)((v * 44) / 100);
+    lv_obj_set_size(o, dia, dia);
+    lv_obj_center(o);
+    lv_obj_set_style_border_opa(o, (lv_opa_t)(220 - v * 220 / 100), 0);
+}
+
+// Leave selection mode: clear the selection and hand the knob back to the shell
+// so a turn opens the app switcher again. File scope so the sweep timer's idle
+// check (above, outside the namespace) and knobPress()/knobExit() can all call it.
+static void radar_exit_select() {
+    radar::select(-1);
+    s_selectMode = false;
+    app_shell::setCaptured(false);
+}
+
+// A pushed design can reorder its six movable layers — sweep, aircraft
+// (blips/selection/off-range/center, all drawn by ac_draw_cb), the
+// selection-banner text canvas, the two plain static image overlays, and the
+// plain color-wash overlay — e.g. so the sweep sits above the text instead
+// of below it, or so the color wash covers everything but the topmost
+// static. The order lists them back-to-front (0=sweep, 1=aircraft, 2=text,
+// 3=static1, 4=static2, 5=overlay), the same convention as the clock's
+// CUSTOM_HAND_ORDER. Unlike the hands (sprites redrawn in order inside one
+// callback), these are separate LVGL objects, so re-stacking means actually
+// moving them; s_overlayImg (CRT+glass, NOT the same thing as the color-wash
+// s_dimLayer above) is reasserted last so it always stays the true top layer
+// regardless of where the other six land.
+
+// Where that order comes from. A theme installed as files alone (Orb Studio) states it
+// in radar_style.json; anything older says nothing and keeps whatever
+// CUSTOM_RADAR_LAYER_ORDER the last firmware push welded in.
+static int radarLayerOrder(const int **out) {
+    static const int welded[] = CUSTOM_RADAR_LAYER_ORDER;
+    if (customStyled() && theme_style::radar().orderN > 0) {
+        *out = theme_style::radar().order;
+        return theme_style::radar().orderN;
+    }
+    *out = welded;
+    return CUSTOM_RADAR_LAYER_ORDER_N;
+}
+
+// The readout's slot in the six-kind order (0=sweep, 1=aircraft, 2=text, 3/4=statics,
+// 5=wash), named because it now stands for a group rather than a single object.
+static constexpr int KIND_TEXT = 2;
+
+static void applyRadarLayerOrder() {
+    const int *order = nullptr;
+    const int orderN = radarLayerOrder(&order);
+    // 0=sweep, 1=aircraft, 2=text, 3=static1, 4=static2, 5=overlay (color
+    // wash). Whichever sweep object is actually active (vector wedge or
+    // rotating image) takes the "sweep" slot — only one of them is ever
+    // visible at a time.
+    const bool sweepImgActive = customStyled() && theme_style::radar().sweepTypeImage;
+    lv_obj_t *byKind[6] = { sweepImgActive ? s_sweepImg : s_sweep, s_acLayer, s_textCanvas, s_staticImg[0], s_staticImg[1], s_dimLayer };
+    for (int i = 0; i < orderN; ++i) {
+        const int k = order[i];
+        if (k < 0 || k >= 6) continue;
+        // Kind 2 is not one object, it is THREE: the card's art, the drawn plate behind the
+        // words, and the words themselves. Only the text was ever in this table, so lifting
+        // the aircraft (kind 1) raised them above the card plate while the text kept rising
+        // above everything — the card sat UNDER the aircraft on the device while Orb Studio
+        // showed it near the top of the stack. They are one thing to the person designing
+        // it, so they move as one, plate first and words last.
+        if (k == KIND_TEXT) {
+            if (s_cardImg) lv_obj_move_foreground(s_cardImg);
+            if (s_cardObj) lv_obj_move_foreground(s_cardObj);
+            if (s_textCanvas) lv_obj_move_foreground(s_textCanvas);
+            continue;
+        }
+        if (byKind[k]) lv_obj_move_foreground(byKind[k]);
+    }
+    if (s_overlayImg) lv_obj_move_foreground(s_overlayImg);
+
+    // What the stack ACTUALLY is, straight from LVGL, rather than what the order array was
+    // supposed to achieve. lv_obj_get_index is the real z-position among siblings, so this
+    // is the answer to "does the device draw the layers the way Orb Studio shows them?"
+    // measured instead of argued. It is how the info card was caught sitting under the
+    // aircraft: its plate and its text were in two different places in this list.
+    {
+        struct { const char *name; lv_obj_t *o; } zs[] = {
+            { "background", s_plateImg },  { "map",     s_gridLayer },
+            { "rings",      s_ringsImg },  { "sweep",   sweepImgActive ? s_sweepImg : s_sweep },
+            { "aircraft",   s_acLayer },   { "cardArt", s_cardImg },
+            { "cardPlate",  s_cardObj },   { "readout", s_textCanvas },
+            { "wash",       s_dimLayer },  { "glass",   s_overlayImg },
+        };
+        char line[240]; int n = 0;
+        n += snprintf(line + n, sizeof(line) - n, "[zorder]");
+        for (auto &z : zs)
+            if (z.o && n < (int)sizeof(line) - 24)
+                n += snprintf(line + n, sizeof(line) - n, " %s=%d", z.name, (int)lv_obj_get_index(z.o));
+        Serial.println(line);
+    }
+}
+
+namespace radar {
+
+static void apply_grid_visibility();   // defined with the flatten pass, used by the probe below
+
+// Diagnostic: hide a single layer so its cost shows up as a frame-rate delta.
+// Deliberately blunt and deliberately not persisted — it exists to answer "which
+// layer is expensive" with a measurement rather than an argument.
+void debugHideLayer(int kind, bool hide) {
+    lv_obj_t *o = nullptr;
+    switch (kind) {
+        case 0: o = (customStyled() && theme_style::radar().sweepTypeImage) ? s_sweepImg : s_sweep; break;
+        case 1: o = s_acLayer;      break;
+        case 2: o = s_textCanvas;   break;
+        case 3: o = s_staticImg[0]; break;
+        case 4: o = s_staticImg[1]; break;
+        case 5: o = s_dimLayer;     break;
+        case 6: o = s_plateImg;     break;
+        case 7: o = s_gridLayer;    break;   // map: roads + coastline + airports, re-vectored per draw
+        case 8: o = s_overlayImg;   break;   // glass + CRT: a full-screen alpha blend, composited
+                                             // over whatever region the sweep invalidates, every frame
+        default: return;
+    }
+    // "Show" for the map layer means "whatever the bake decided", not blindly visible:
+    // un-hiding a map that is baked into the background would turn per-frame
+    // re-vectoring back on, which is exactly what the probe did to tonight's baseline.
+    if (kind == 7 && !hide) { apply_grid_visibility(); return; }
+    if (o) show(o, !hide);
+    Serial.printf("[radar] debug: layer %d %s\n", kind, hide ? "hidden" : "shown");
+}
+
+
+static void refresh_custom_text();   // defined near select()/selected(); update() below needs it forward-declared
+
+void setTheme(int t) {
+    s_theme = ((t % THEME_COUNT) + THEME_COUNT) % THEME_COUNT;
+    const bool drg = orb();
+
+    if (officeMode()) {
+        const AppPalette &p = app_theme::palette();
+        s_cRing = p.hairline; s_cLead = p.accent; s_cInk = p.ink; s_cSoft = p.soft;
+    } else {
+        switch (s_theme) {                          // pick the scope chrome palette
+            case THEME_MILITARY:
+                s_cRing = lv_color_hex(0x49C46B); s_cLead = lv_color_hex(0x76E08C);
+                s_cInk  = lv_color_hex(0xE0FFE6); s_cSoft = lv_color_hex(0x9FD7A8); break;
+            case THEME_AVIATOR:
+                s_cRing = AVI_RING; s_cLead = AVI_LEAD; s_cInk = AVI_INK; s_cSoft = AVI_SOFT; break;
+            default:                                // orb (uses its own colors elsewhere) / any invalid value
+                s_cRing = COL_GREEN; s_cLead = COL_LEAD; s_cInk = COL_INK; s_cSoft = COL_SOFT; break;
+        }
+    }
+
+    if (s_parent) {
+        if (drg) {
+            lv_obj_set_style_bg_color(s_parent, ORB_BG_TOP, 0);
+            lv_obj_set_style_bg_grad_color(s_parent, ORB_BG_BOT, 0);
+            lv_obj_set_style_bg_grad_dir(s_parent, LV_GRAD_DIR_VER, 0);
+        } else {
+            lv_obj_set_style_bg_color(s_parent, officeMode() ? app_theme::palette().bg : (aviator() ? AVI_BG : lv_color_black()), 0);
+            lv_obj_set_style_bg_grad_dir(s_parent, LV_GRAD_DIR_NONE, 0);
+        }
+        lv_obj_set_style_bg_opa(s_parent, LV_OPA_COVER, 0);
+    }
+    // A custom design has no compass letters, range readout, or pulse ring in
+    // its own preview — hide all of the native chrome so the device matches it.
+    const bool styled = customStyled();
+    for (int i = 0; i < 4; ++i) show(s_rose[i], !drg && !styled);   // hide compass in Orb
+    show(s_rangeLbl, !drg && s_rangeLblVisible && !styled);
+    show(s_centerDot, !drg && !styled);                   // orb draws an orange triangle instead; custom style draws its own center marker in ac_draw_cb
+    show(s_pulse, !drg && !styled);
+
+    // retint the persistent chrome objects for the active palette
+    if (s_rose[0]) lv_obj_set_style_text_color(s_rose[0], s_cInk, 0);
+    for (int i = 1; i < 4; ++i) if (s_rose[i]) lv_obj_set_style_text_color(s_rose[i], s_cSoft, 0);
+    if (s_centerDot) lv_obj_set_style_bg_color(s_centerDot, s_cInk, 0);
+    if (s_pulse)     lv_obj_set_style_border_color(s_pulse, s_cInk, 0);
+    if (s_rangeLbl)  lv_obj_set_style_text_color(s_rangeLbl, s_cRing, 0);
+
+    flow_redraw_all();
+    if (s_parent) lv_obj_invalidate(s_parent);
+    show_theme_label(THEME_NAMES[s_theme]);
+    if (s_themeCb) s_themeCb(s_theme);
+}
+
+int  theme() { return s_theme; }
+const char *themeName(int t) {
+    return (t >= 0 && t < THEME_COUNT) ? THEME_NAMES[t] : "";
+}
+void cycleTheme() { setTheme(s_theme + 1); }
+void flashThemeName() { show_theme_label(THEME_NAMES[s_theme]); }   // touch reveal (no theme change)
+void setThemeChangedCb(void (*cb)(int)) { s_themeCb = cb; }
+// Only meaningful while the loading notice is up: once aircraft arrive the notice is gone
+// and there is nothing to relabel, and a scope with traffic on it does not need telling
+// that the feed is fine.
+void setFeedNote(const char *note) {
+    if (!s_loading || !s_loadingPending) return;
+    lv_label_set_text(s_loading, note ? note : "Loading aircraft\nand location data");
+}
+
+
+void setRangeLabelVisible(bool v) { s_rangeLblVisible = v; if (s_rangeLbl) show(s_rangeLbl, v && !orb() && !customStyled()); }
+
+void setSweepEnabled(bool on) {
+    s_sweepEnabled = on;
+    const bool sweepImgActive = customStyled() && theme_style::radar().sweepTypeImage;
+    if (s_sweep) {
+        show(s_sweep, on && !sweepImgActive);
+        if (!on) lv_obj_invalidate(s_sweep);   // clear any wedge currently painted
+    }
+    if (s_sweepImg) show(s_sweepImg, on && sweepImgActive);
+}
+bool sweepEnabled() { return s_sweepEnabled; }
+
+// Defined with the flatten pass below; setAirportsEnabled sits above it in the file.
+static void take_map_snapshot();
+static void rebuild_flat_background();
+static void apply_grid_visibility();
+
+void setAirportsEnabled(bool on) {
+    s_airportsEnabled = on;
+    if (s_gridLayer) lv_obj_invalidate(s_gridLayer);   // repaint the chrome with/without markers
+    if (customStyled()) {          // the etched copy includes the markers; re-etch without them
+        take_map_snapshot();
+        rebuild_flat_background();
+        apply_grid_visibility();
+    }
+}
+bool airportsEnabled() { return s_airportsEnabled; }
+
+// 0 = off, 1 = short, 2 = medium (default), 3 = long. Controls both the per-aircraft
+// trail and the persistent flow layer (the long-lived "where everything has been" tracks).
+void setTrailLength(int level) {
+    switch (level) {
+        case 0: s_trailMax = 0;  s_flowMax = 0;    s_flowGenMax = 0;  break;
+        // Segment counts halved from (150/1500/700). A repaint costs roughly 300 us per
+        // segment on this hardware — that is LVGL canvas draw-call overhead, not line
+        // length — so 700 segments is a 210 ms repaint and 240 is a 70 ms one. Even
+        // batched, a repaint should fit inside about one frame rather than three.
+        case 1: s_trailMax = 3;  s_flowMax = 80;   s_flowGenMax = 8;  break;   // ~16 s
+        case 3: s_trailMax = 12; s_flowMax = 700;  s_flowGenMax = 30; break;   // ~60 s
+        default: s_trailMax = 7; s_flowMax = 240;  s_flowGenMax = 14; break;   // ~28 s
+    }
+    if (s_flowMax == 0) { s_flow.clear(); s_trails.clear(); }
+    else while ((int)s_flow.size() > s_flowMax) s_flow.pop_front();
+    flow_redraw_all();                              // repaint the flow canvas at the new length
+    if (s_acLayer) lv_obj_invalidate(s_acLayer);
+}
+
+void setMaxOnScreen(int n) {
+    s_maxOnScreen = (n < 1) ? 1 : (n > ADSB_MAX_AIRCRAFT ? ADSB_MAX_AIRCRAFT : n);  // never more than the feed pulls
+    if (s_acLayer) lv_obj_invalidate(s_acLayer);
+}
+
+void setLargeText(bool on) {
+    s_bigText = on;
+    if (s_acLayer) lv_obj_invalidate(s_acLayer);
+}
+
+
+// Section ledger for radar::init(), measured taking 3.7 MB — the single largest consumer
+// on the device, allocated at boot whether or not Flight Tracker is ever opened.
+static void rmark(const char *what) {
+#ifdef ARDUINO
+    static uint32_t prev = 0;
+    const uint32_t now = (uint32_t)ESP.getFreePsram();
+    Serial.printf("[psram/radar] %-24s free %6u KB", what, (unsigned)(now / 1024));
+    if (prev && prev >= now) Serial.printf("   (-%u KB)", (unsigned)((prev - now) / 1024));
+    prev = now;
+    Serial.println();
+#else
+    (void)what;
+#endif
+}
+
+void init(void *lv_parent) {
+    lv_obj_t *parent = (lv_obj_t *)lv_parent;
+    s_parent = parent;
+    s_cx = SCREEN_CX;
+    s_cy = SCREEN_CY;
+    s_acs.clear();
+    s_trails.clear();
+    s_flow.clear();
+    s_selHex.clear();
+    s_flowRedrawCtr = 0;
+
+    lv_obj_clear_flag(parent, LV_OBJ_FLAG_SCROLLABLE);
+
+    // Baked plate (background+rings+crosshair): the bottom-most layer, created
+    // first so everything else (coastline, sweep, aircraft) draws over it.
+    rmark("radar::init start");
+    s_plateImg = lv_img_create(parent);
+    rmark("after plate img");
+    lv_obj_clear_flag(s_plateImg, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_center(s_plateImg);
+    lv_obj_add_flag(s_plateImg, LV_OBJ_FLAG_HIDDEN);
+
+    // Canvas OBJECT only; its 636 KB buffer arrives via canvas_acquire() the first time
+    // a trail segment actually needs drawing (see flow_redraw_all/update), and leaves
+    // when trails are cleared. Hidden while unbuffered so composition skips it.
+    rmark("after flow buffer");
+    s_flowCanvas = lv_canvas_create(parent);
+    lv_obj_clear_flag(s_flowCanvas, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(s_flowCanvas, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_center(s_flowCanvas);
+
+    s_gridLayer = make_layer(parent, grid_draw_cb);
+
+    // Rings and crosshair, created straight after the map so LVGL's own creation order
+    // puts the etching over the roads. Everything movable is lifted above this by
+    // applyRadarLayerOrder(), so it can never end up over an aircraft.
+    s_ringsImg = lv_img_create(parent);
+    lv_obj_clear_flag(s_ringsImg, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_center(s_ringsImg);
+    lv_obj_add_flag(s_ringsImg, LV_OBJ_FLAG_HIDDEN);
+
+    s_sweep     = make_layer(parent, sweep_draw_cb);
+    s_acLayer   = make_layer(parent, ac_draw_cb);
+
+    // The sweep's "image" type: a real lv_img, rotated live (see
+    // sweep_timer_cb), shown instead of s_sweep's vector wedge when active.
+    rmark("after flow canvas");
+    s_sweepImg = lv_img_create(parent);
+    rmark("after sweep img");
+    // Antialias the sweep's rotation. This was previously off, on the reasoning that the
+    // blade's edges "are a soft glow to begin with" so filtering bought nothing. That was
+    // true of the sweep it was written for and is false of a themed one: Steam Punk's is
+    // hard-edged brass with gear teeth and a thin shaft, and nearest-neighbour rotation
+    // makes that fine detail crawl and snap from frame to frame. Read as jitter on device.
+    //
+    // The cost argument does not survive measurement either. The sprite is 73x227, about
+    // 16k pixels; the ~880 ms/s this screen spends in LVGL goes on recompositing the
+    // near-full-screen area the rotation dirties, not on the transform itself. Filtering
+    // it is close to free at this size.
+    // Smooth filtering, still on, and deliberately left that way until somebody measures it.
+    //
+    // Turning it off looked like an obvious win by analogy with the wind crank, where the
+    // same call was the difference between a handle that kept up and one that lagged. It was
+    // tried here and the A/B said nothing: Zion's Modern design draws a VECTOR sweep, so this
+    // object is not even on screen, and the apparent improvement in the first run was the
+    // scope settling rather than the change. ?orb sweepaa flips it live on a design that does
+    // use an image sweep, which is where the question can actually be answered.
+    lv_img_set_antialias(s_sweepImg, true);
+    lv_obj_clear_flag(s_sweepImg, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(s_sweepImg, LV_OBJ_FLAG_HIDDEN);
+
+    s_rose[0] = make_label(parent, "N", &lv_font_montserrat_28, COL_INK,  LV_ALIGN_TOP_MID,    0, 12);
+    s_rose[1] = make_label(parent, "S", &lv_font_montserrat_16, COL_SOFT, LV_ALIGN_BOTTOM_MID, 0, -12);
+    s_rose[2] = make_label(parent, "E", &lv_font_montserrat_16, COL_SOFT, LV_ALIGN_RIGHT_MID, -12, 0);
+    s_rose[3] = make_label(parent, "W", &lv_font_montserrat_16, COL_SOFT, LV_ALIGN_LEFT_MID,   12, 0);
+
+    char rng[16];
+    snprintf(rng, sizeof(rng), "%.0f km", (double)RANGE_KM_DEFAULT);
+    s_rangeLbl = make_label(parent, rng, &lv_font_montserrat_14, COL_GREEN, LV_ALIGN_CENTER, 92, -8);
+    lv_obj_set_style_text_opa(s_rangeLbl, 128, 0);
+
+    // theme-name banner: flashed briefly on a theme change or a screen tap (see
+    // show_theme_label), sits below the HUD status row (y ~50-70) so it never overlaps
+    // it. A solid black plaque behind white text keeps it readable over any theme/scene.
+    // Deliberately plain and unthemeable, same reasoning as the update overlay: it is a
+    // system message about the device's state, and a theme that styled it into
+    // invisibility would defeat the one job it has.
+    s_loading = make_label(parent, "Loading aircraft\nand location data", &lv_font_montserrat_20,
+                           lv_color_white(), LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_bg_color(s_loading, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(s_loading, LV_OPA_80, 0);
+    lv_obj_set_style_radius(s_loading, 12, 0);
+    lv_obj_set_style_pad_all(s_loading, 18, 0);
+    lv_obj_set_style_text_align(s_loading, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_line_space(s_loading, 6, 0);
+
+    // A live number is the whole fix: frozen text and text that is still true both LOOK
+    // identical after the first render, and "is it stuck" was a real question asked about
+    // this exact screen. A number that visibly counts up answers it without narrating
+    // stages the poll loop does not actually have (it is one repeating step: ask, wait,
+    // maybe get an answer, not a multi-part pipeline worth pretending to show).
+    s_loadTicker = make_label(parent, "", &lv_font_montserrat_14,
+                              lv_color_hex(0xAAB2C0), LV_ALIGN_CENTER, 0, 58);
+    show(s_loadTicker, false);
+    show(s_loading, false);
+
+    // A small, honest banner near the bottom of the dial for when the aircraft feed is not
+    // answering. Deliberately NOT the big centred "Loading" box: by the time this shows,
+    // there is usually a scope full of last-known traffic worth still seeing, and covering
+    // it would be its own kind of lie. Amber rather than red because nothing is broken.
+    s_feedWarn = make_label(parent, "", &lv_font_montserrat_14,
+                            lv_color_hex(0xFFB23C), LV_ALIGN_BOTTOM_MID, 0, -46);
+    lv_obj_set_style_bg_color(s_feedWarn, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(s_feedWarn, LV_OPA_70, 0);
+    lv_obj_set_style_radius(s_feedWarn, 8, 0);
+    lv_obj_set_style_pad_all(s_feedWarn, 8, 0);
+    lv_obj_set_style_text_align(s_feedWarn, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_line_space(s_feedWarn, 3, 0);
+    show(s_feedWarn, false);
+
+    s_themeLabel = make_label(parent, "", &lv_font_montserrat_20, lv_color_white(), LV_ALIGN_TOP_MID, 0, 92);
+    lv_obj_set_style_bg_color(s_themeLabel, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(s_themeLabel, LV_OPA_90, 0);
+    lv_obj_set_style_radius(s_themeLabel, 8, 0);
+    lv_obj_set_style_pad_hor(s_themeLabel, 14, 0);
+    lv_obj_set_style_pad_ver(s_themeLabel, 4, 0);
+    show(s_themeLabel, false);
+
+    s_pulse = lv_obj_create(parent);
+    lv_obj_remove_style_all(s_pulse);
+    lv_obj_set_size(s_pulse, 12, 12);
+    lv_obj_center(s_pulse);
+    lv_obj_set_style_radius(s_pulse, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_opa(s_pulse, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_color(s_pulse, COL_INK, 0);
+    lv_obj_set_style_border_width(s_pulse, 2, 0);
+    lv_obj_clear_flag(s_pulse, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, s_pulse);
+    lv_anim_set_exec_cb(&a, pulse_anim_cb);
+    lv_anim_set_values(&a, 0, 100);
+    lv_anim_set_time(&a, 2600);
+    lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
+    lv_anim_start(&a);
+
+    s_centerDot = lv_obj_create(parent);
+    lv_obj_remove_style_all(s_centerDot);
+    lv_obj_set_size(s_centerDot, 7, 7);
+    lv_obj_center(s_centerDot);
+    lv_obj_set_style_radius(s_centerDot, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(s_centerDot, COL_INK, 0);
+    lv_obj_set_style_bg_opa(s_centerDot, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(s_centerDot, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+
+    // Selection text banners (callsign/stats/route), a Launch Kit push only — a
+    // dedicated transparent canvas (not LVGL labels), so a banner can curve along
+    // an arc and glow, redrawn by refresh_custom_text() whenever the custom
+    // design is active and something is selected. Created after the aircraft
+    // layer so banners sit above the scope, rings, and blips.
+    // Created BEFORE the text canvas so they sit under it in LVGL's own z-order, which is
+    // creation order among siblings — the card is a backdrop for the words, never over them.
+    s_cardImg = lv_img_create(parent);
+    lv_obj_clear_flag(s_cardImg, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(s_cardImg, LV_OBJ_FLAG_HIDDEN);
+    s_cardObj = lv_obj_create(parent);
+    lv_obj_remove_style_all(s_cardObj);
+    lv_obj_clear_flag(s_cardObj, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(s_cardObj, LV_OBJ_FLAG_HIDDEN);
+
+#if CUSTOM_HAS_RADAR
+    {
+        // Canvas OBJECT only; the 636 KB buffer is acquired by refresh_custom_text()
+        // while banners are actually visible (a selection exists, or an always-on
+        // RTEXT4 range banner is compiled in) and released when they are not.
+        rmark("after text buffer");
+        s_textCanvas = lv_canvas_create(parent);
+        lv_obj_clear_flag(s_textCanvas, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_flag(s_textCanvas, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_center(s_textCanvas);
+    }
+#endif
+
+    // Two plain decorative overlays — no rotation, just position+opacity —
+    // insertable anywhere in the layer order via applyRadarLayerOrder().
+    for (int i = 0; i < 2; ++i) {
+        s_staticImg[i] = lv_img_create(parent);
+        lv_obj_clear_flag(s_staticImg[i], LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_flag(s_staticImg[i], LV_OBJ_FLAG_HIDDEN);
+    }
+
+    // The "Overlay" card: a plain full-scope color wash, no image — just a
+    // flat fill+opacity rect sized to the whole screen (the round display's
+    // own hardware/LVGL clipping crops it to the circle, same as everything
+    // else here, so no separate mask is needed). Insertable anywhere in the
+    // layer order like the two statics above.
+    s_dimLayer = lv_obj_create(parent);
+    lv_obj_remove_style_all(s_dimLayer);
+    lv_obj_set_size(s_dimLayer, SCREEN_W, SCREEN_H);
+    lv_obj_center(s_dimLayer);
+    lv_obj_clear_flag(s_dimLayer, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_style_bg_opa(s_dimLayer, LV_OPA_TRANSP, 0);
+    lv_obj_add_flag(s_dimLayer, LV_OBJ_FLAG_HIDDEN);
+
+    // Baked overlay (CRT+glass): the top-most layer, created last so it sits
+    // over the sweep/aircraft/selection-banner layers too, matching the
+    // editor's own draw order (CRT/glass are painted after everything else).
+    rmark("after statics");
+    s_overlayImg = lv_img_create(parent);
+    rmark("after overlay img");
+    lv_obj_clear_flag(s_overlayImg, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_center(s_overlayImg);
+    lv_obj_add_flag(s_overlayImg, LV_OBJ_FLAG_HIDDEN);
+
+    s_sweepDeg = 0.0f;
+    s_prevSweepDeg = 0.0f;
+    if (!s_timer) s_timer = lv_timer_create(sweep_timer_cb, SWEEP_FRAME_MS, nullptr);
+
+    rmark("before refreshCustomStyle");
+    // NOT decoding the artwork here any more. This call pulled the plate, sweep, blip
+    // and both static layers off the SD card at boot — measured at 2431 KB — for a
+    // screen the user may never open. Flight Tracker already has the right lifecycle:
+    // knobEnter() calls refreshCustomStyle() when the app is actually shown, and
+    // knobExit() calls radar_sprite_release() when it is left. init() was simply doing
+    // it eagerly as well, so the memory was claimed from boot and never handed back.
+    //
+    // Anything that boots straight into Flight Tracker (CUSTOM_BOOT_TARGET == 2) still
+    // gets its artwork, because that path goes through the app shell's onEnter.
+    rmark("after refreshCustomStyle");
+    setTheme(s_theme);
+    rmark("after setTheme (init done)");
+}
+
+// (Re-)attach the plate/overlay image sources, decoding lazily if needed.
+// ---------------- flattened static background ----------------
+// The radar's lower layers never change, but every sweep frame made LVGL
+// re-blend all of them across the area the rotating hand dirties (roughly
+// two thirds of the screen). Measured: ~880 ms of every second inside LVGL,
+// ~6 fps, which is what made the sweep step ~2.2 deg at a time instead of turn.
+//
+// So they are composited ONCE here, into a single opaque image, and the plate
+// object is pointed at that instead. Per frame the base then costs one plain
+// copy rather than a stack of alpha blends.
+//
+// Which layers may be absorbed is decided by the theme's own layer order, not
+// assumed: walk it from the back and take static layers until the first thing
+// that moves. Anything above a moving layer has to stay live or it would be
+// drawn underneath something it is supposed to cover. For Steam Punk's
+// { 3, 5, 1, 2, 0, 4 } that absorbs static1 and the colour wash, and leaves
+// static2 alone because it sits above the sweep on purpose.
+//
+// Drawing is done with LVGL's own canvas rather than hand-rolled blending, so
+// the merged result is produced by the exact code path that drew the layers
+// separately. Scale, opacity and centring therefore match by construction.
+static lv_color_t  *s_flatBuf    = nullptr;    // PSRAM, SCREEN_W*SCREEN_H
+static lv_obj_t    *s_flatCanvas = nullptr;    // offscreen only; never parented into the view
+static bool         s_flatOn     = false;
+static bool         s_flatTook[3] = { false, false, false };   // static1, static2, wash
+
+// The map (roads + coastline + airports), etched. s_gridLayer re-vectors all of it on
+// every frame through its draw callback — 513 polylines at Zion's location, measured at
+// roughly a quarter of the radar's whole frame budget. The vectors only actually change
+// when the projection does (home moved, range zoomed, airports toggled), so the layer is
+// rendered ONCE into this snapshot on those events, the snapshot is baked into the
+// flattened background, and the live layer is hidden. Zion's three-section architecture
+// assumes the map is "etched in"; this makes that assumption true.
+static lv_img_dsc_t *s_mapSnap  = nullptr;
+static bool          s_mapBaked = false;
+static bool          s_ringsBaked = false;   // the etching went into the flat plate, so hide the live object
+
+static void take_map_snapshot() {
+    if (!s_gridLayer || !customStyled()) return;
+    // The layer must be visible while it renders: snapshot drives the object's own draw
+    // events, and a hidden object draws nothing, which would etch an empty map.
+    show(s_gridLayer, true);
+    lv_obj_update_layout(s_gridLayer);
+    if (s_mapSnap) { lv_snapshot_free(s_mapSnap); s_mapSnap = nullptr; }
+    s_mapSnap = lv_snapshot_take(s_gridLayer, LV_IMG_CF_TRUE_COLOR_ALPHA);
+    if (!s_mapSnap) { Serial.println("[radar] map snapshot failed; live layer stays"); return; }
+
+    // Punch the exclusion zones out of the etched map.
+    //
+    // Roads, coastline and airports come from three separate modules that know nothing
+    // about zones, and teaching each of them to clip would mean threading zone state
+    // through all three. But they have already been flattened into one RGBA image by the
+    // line above — so the whole job is a single pass over that image, zeroing alpha
+    // inside the zones. Every map layer gets masked at once, and the background art shows
+    // through cleanly where a theme asked it to.
+    //
+    // Runs only when the projection changes (home moved, range zoomed), not per frame.
+    if (customStyled() && theme_style::radar().zoneCount > 0) {
+        // LV_IMG_CF_TRUE_COLOR_ALPHA at LV_COLOR_DEPTH 16 is 3 bytes per pixel: two of
+        // colour, then the alpha byte this clears.
+        const int bpp = LV_IMG_PX_SIZE_ALPHA_BYTE;
+        uint8_t *px = (uint8_t *)s_mapSnap->data;
+        const int w = s_mapSnap->header.w, h = s_mapSnap->header.h;
+        int cleared = 0;
+        for (int y = 0; y < h; ++y) {
+            for (int x = 0; x < w; ++x) {
+                if (!in_excluded_zone((lv_coord_t)x, (lv_coord_t)y)) continue;
+                px[(y * w + x) * bpp + (bpp - 1)] = 0x00;
+                ++cleared;
+            }
+        }
+        Serial.printf("[radar] map: %d px cleared by %d exclusion zone(s)\n",
+                      cleared, theme_style::radar().zoneCount);
+    }
+}
+
+// The live map layer earns its keep only while there is no baked copy. Called after any
+// rebuild attempt, so a failed bake degrades to the old per-frame path, never to no map.
+static void apply_grid_visibility() {
+    if (s_gridLayer) show(s_gridLayer, !(customStyled() && s_mapBaked));
+}
+
+static void release_flat_background() {
+    if (s_flatCanvas) { lv_obj_del(s_flatCanvas); s_flatCanvas = nullptr; }
+    if (s_flatBuf)    { heap_caps_free(s_flatBuf); s_flatBuf = nullptr; }
+    s_flatOn = false;
+    s_flatTook[0] = s_flatTook[1] = s_flatTook[2] = false;
+    s_ringsBaked = false;
+    if (s_ringsImg && radar_custom_rings()) show(s_ringsImg, true);
+}
+
+static void rebuild_flat_background() {
+    s_flatOn = false;
+    s_mapBaked = false;
+    s_ringsBaked = false;
+    s_flatTook[0] = s_flatTook[1] = s_flatTook[2] = false;
+    if (s_ringsImg && radar_custom_rings()) show(s_ringsImg, true);
+    if (!customStyled() || !s_plateImg) return;
+
+    const lv_img_dsc_t *plate = radar_custom_plate();
+    if (!plate) return;   // nothing opaque to build on; leave the live stack alone
+
+    // Which layers sit below the first moving one.
+    const int *order = nullptr;
+    const int orderN = radarLayerOrder(&order);
+    bool take[3] = { false, false, false };
+    int  taken = 0;
+    for (int i = 0; i < orderN; ++i) {
+        const int k = order[i];
+        if (k == 0 || k == 1 || k == 2) break;      // sweep / aircraft / text: stop here
+        if (k == 3) { take[0] = true; ++taken; }
+        else if (k == 4) { take[1] = true; ++taken; }
+        else if (k == 5) { take[2] = true; ++taken; }
+    }
+    if (!taken && !s_mapSnap) return;   // nothing to merge; not worth 434 KB to copy the plate alone
+
+    const theme_style::Radar &rs = theme_style::radar();
+    const theme_style::RadarStatic *st[2] = { &rs.static1, &rs.static2 };
+    // Recheck that the layers we picked are actually contributing; a theme can
+    // list a layer in its order and then switch it off.
+    bool any = (s_mapSnap != nullptr);
+    for (int i = 0; i < 2; ++i) if (take[i] && st[i]->show && radar_custom_static(i)) any = true;
+    if (take[2] && rs.overlayEnabled && rs.overlayOpacity > 0) any = true;
+    if (!any) return;
+
+    if (!s_flatBuf) {
+        s_flatBuf = (lv_color_t *)heap_caps_malloc((size_t)SCREEN_W * SCREEN_H * sizeof(lv_color_t),
+                                                   MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!s_flatBuf) { Serial.println("[radar] flatten: no PSRAM, keeping live layers"); return; }
+    }
+    if (!s_flatCanvas) {
+        // Parented to the screen but permanently hidden: it exists to own the
+        // buffer and give lv_canvas_draw_* somewhere to render, never to display.
+        s_flatCanvas = lv_canvas_create(lv_scr_act());
+        if (!s_flatCanvas) { Serial.println("[radar] flatten: no canvas"); return; }
+        lv_obj_add_flag(s_flatCanvas, LV_OBJ_FLAG_HIDDEN);
+    }
+    lv_canvas_set_buffer(s_flatCanvas, s_flatBuf, SCREEN_W, SCREEN_H, LV_IMG_CF_TRUE_COLOR);
+
+    // 1. the plate, filling the canvas
+    {
+        lv_draw_img_dsc_t d; lv_draw_img_dsc_init(&d);
+        lv_canvas_draw_img(s_flatCanvas, 0, 0, plate, &d);
+    }
+    // 1b. the etched map, directly on the plate — the same slot the live s_gridLayer
+    //     occupies in the stack today (below the decorations and the wash).
+    if (s_mapSnap) {
+        lv_draw_img_dsc_t d; lv_draw_img_dsc_init(&d);
+        lv_canvas_draw_img(s_flatCanvas, 0, 0, s_mapSnap, &d);
+        s_mapBaked = true;
+    }
+    // 1c. the etched rings, over the map for the same reason they sit over it live.
+    if (const lv_img_dsc_t *rings = radar_custom_rings()) {
+        lv_draw_img_dsc_t d; lv_draw_img_dsc_init(&d);
+        lv_canvas_draw_img(s_flatCanvas, 0, 0, rings, &d);
+        s_ringsBaked = true;
+    }
+    // 1d. PUT THE PLATE BACK INSIDE THE KEEP-OUT AREAS.
+    //
+    // Here rather than on each layer, because it is the one place where everything a zone is
+    // supposed to hide has been drawn and nothing it is supposed to keep has been. The map
+    // arrives already punched (take_map_snapshot clears its alpha), but the rings are a
+    // separate baked image and nothing was punching those, so a design with a keep-out area
+    // got a clean gap in the roads with the range rings still ruled straight across it.
+    //
+    // Copying the plate back is simpler than teaching each layer to clip, and it cannot
+    // disagree with itself: whatever was on the plate is exactly what returns. It also means
+    // a layer added above this line is covered for free, and one added below is deliberately
+    // not, which is the right default for decoration.
+    //
+    // Runs when the theme changes, not per frame.
+    if (rs.zoneCount > 0 && plate && plate->header.cf == LV_IMG_CF_TRUE_COLOR &&
+        plate->header.w == SCREEN_W && plate->header.h == SCREEN_H && s_flatBuf) {
+        const lv_color_t *src = (const lv_color_t *)plate->data;
+        int restored = 0;
+        for (int y = 0; y < SCREEN_H; ++y) {
+            for (int x = 0; x < SCREEN_W; ++x) {
+                if (!in_excluded_zone((lv_coord_t)x, (lv_coord_t)y)) continue;
+                s_flatBuf[y * SCREEN_W + x] = src[y * SCREEN_W + x];
+                ++restored;
+            }
+        }
+        Serial.printf("[radar] %d px of map and rings put back to the plate by %d keep-out area(s)\n",
+                      restored, rs.zoneCount);
+    }
+
+    // 2. the decorative statics we are allowed to absorb, same transform as the
+    //    live path above (zoom about the image's own centre, positioned by
+    //    unscaled w/h so the visual centre lands on x,y at any scale)
+    for (int i = 0; i < 2; ++i) {
+        if (!take[i] || !st[i]->show) continue;
+        const lv_img_dsc_t *img = radar_custom_static(i);
+        if (!img) continue;
+        lv_draw_img_dsc_t d; lv_draw_img_dsc_init(&d);
+        d.zoom    = (uint16_t)lroundf(st[i]->scale * 256.0f);
+        d.opa     = (lv_opa_t)st[i]->opacity;
+        d.pivot.x = (lv_coord_t)(img->header.w / 2);
+        d.pivot.y = (lv_coord_t)(img->header.h / 2);
+        lv_canvas_draw_img(s_flatCanvas,
+                           (lv_coord_t)(st[i]->x - (int)img->header.w / 2),
+                           (lv_coord_t)(st[i]->y - (int)img->header.h / 2), img, &d);
+        s_flatTook[i] = true;
+    }
+    // 3. the colour wash, over everything absorbed so far
+    if (take[2] && rs.overlayEnabled && rs.overlayOpacity > 0) {
+        lv_draw_rect_dsc_t d; lv_draw_rect_dsc_init(&d);
+        d.bg_color = lv_color_hex(rs.overlayColor);
+        d.bg_opa   = (lv_opa_t)rs.overlayOpacity;
+        d.radius   = 0;
+        lv_canvas_draw_rect(s_flatCanvas, 0, 0, SCREEN_W, SCREEN_H, &d);
+        s_flatTook[2] = true;
+    }
+
+    // Swap the plate over to the merged image and retire what it now contains.
+    lv_img_set_src(s_plateImg, lv_canvas_get_img(s_flatCanvas));
+    show(s_plateImg, true);
+    if (s_ringsBaked && s_ringsImg) show(s_ringsImg, false);
+    for (int i = 0; i < 2; ++i) if (s_flatTook[i] && s_staticImg[i]) show(s_staticImg[i], false);
+    if (s_flatTook[2] && s_dimLayer) show(s_dimLayer, false);
+    s_flatOn = true;
+    Serial.printf("[radar] flattened into the plate: map=%d rings=%d static1=%d static2=%d wash=%d\n",
+                  (int)s_mapBaked, (int)s_ringsBaked, (int)s_flatTook[0], (int)s_flatTook[1], (int)s_flatTook[2]);
+}
+
+// Call once at init(), and again from Flight Tracker's onEnter after an
+// onExit released the decoded PSRAM (radar_sprite_release()) — an image
+// object's src has to be re-set after that, the same way the clock's
+// draw_custom() re-fetches custom_plate()/custom_overlay() every redraw.
+void refreshCustomStyle() {
+    s_pacingStale = true;
+    if (s_plateImg) {
+        const lv_img_dsc_t *plate = radar_custom_plate();
+        if (plate) { lv_img_set_src(s_plateImg, plate); show(s_plateImg, true); }
+        else show(s_plateImg, false);
+    }
+    if (s_ringsImg) {
+        const lv_img_dsc_t *rg = radar_custom_rings();
+        if (rg) { lv_img_set_src(s_ringsImg, rg); show(s_ringsImg, true); }
+        else show(s_ringsImg, false);
+    }
+    if (s_overlayImg) {
+        const lv_img_dsc_t *ov = radar_custom_overlay();
+        if (ov) { lv_img_set_src(s_overlayImg, ov); show(s_overlayImg, true); }
+        else show(s_overlayImg, false);
+    }
+    // Two plain decorative overlays: position/opacity come from theme_style
+    // (per-theme, see radar_style.json), the pixels from radar_sprite.cpp —
+    // same SD-first-then-flash decode as the plate/overlay, just centered at
+    // (x,y) instead of always filling the whole screen.
+    const theme_style::RadarStatic *rs[2] = { &theme_style::radar().static1, &theme_style::radar().static2 };
+    for (int i = 0; i < 2; ++i) {
+        if (!s_staticImg[i]) continue;
+        const lv_img_dsc_t *img = rs[i]->show ? radar_custom_static(i) : nullptr;
+        if (img) {
+            lv_img_set_src(s_staticImg[i], img);
+            // Zoom (256 = 100%) scales around the image's own pivot, which
+            // defaults to its center — so positioning by unscaled w/h below
+            // still lands the visual center at (x,y) at any scale.
+            lv_img_set_zoom(s_staticImg[i], (uint16_t)lroundf(rs[i]->scale * 256.0f));
+            lv_obj_set_pos(s_staticImg[i], (lv_coord_t)(rs[i]->x - (int)img->header.w / 2), (lv_coord_t)(rs[i]->y - (int)img->header.h / 2));
+            lv_obj_set_style_img_opa(s_staticImg[i], (lv_opa_t)rs[i]->opacity, 0);
+            show(s_staticImg[i], true);
+        } else {
+            show(s_staticImg[i], false);
+        }
+    }
+    // The sweep's "image" type: pivot/center are compile-time (coupled to
+    // whichever sprite is actually baked in, same reasoning as the blip
+    // icon's pivot) — angle is live, driven by sweep_timer_cb via s_sweepDeg.
+    if (s_sweepImg) {
+        const bool useImage = customStyled() && theme_style::radar().sweepTypeImage;
+        const lv_img_dsc_t *sweepSrc = useImage ? radar_custom_sweep() : nullptr;
+        if (sweepSrc) {
+            lv_img_set_src(s_sweepImg, sweepSrc);
+            // Theme data first, welded macros as the fallback (see theme_style::Radar).
+            const theme_style::Radar &rsw = theme_style::radar();
+            const int spx = rsw.sweepPivotX  >= 0 ? rsw.sweepPivotX  : CUSTOM_SWEEP_IMAGE_PIVOT_X;
+            const int spy = rsw.sweepPivotY  >= 0 ? rsw.sweepPivotY  : CUSTOM_SWEEP_IMAGE_PIVOT_Y;
+            const int scx = rsw.sweepCenterX >= 0 ? rsw.sweepCenterX : CUSTOM_SWEEP_IMAGE_CENTER_X;
+            const int scy = rsw.sweepCenterY >= 0 ? rsw.sweepCenterY : CUSTOM_SWEEP_IMAGE_CENTER_Y;
+            lv_img_set_pivot(s_sweepImg, spx, spy);
+            lv_obj_set_pos(s_sweepImg, scx - spx, scy - spy);
+            lv_img_set_angle(s_sweepImg, (int16_t)lroundf(s_sweepDeg * 10.0f));
+            show(s_sweepImg, true);
+#if !defined(ARDUINO)
+            // SIM_SWEEP_DEG=90 pins the hand at a known angle for a capture. LVGL skips the
+            // transform entirely at angle 0, so an unpinned screenshot is taken at the one
+            // angle where a wrong pivot cannot show — which is how a rotation about the
+            // wrong point survives every screenshot anyone thinks to take.
+            if (const char *forced = getenv("SIM_SWEEP_DEG")) {
+                s_sweepDeg = (float)atof(forced);
+                lv_img_set_angle(s_sweepImg, (int16_t)lroundf(s_sweepDeg * 10.0f));
+            }
+#endif
+            // Report what LVGL actually ended up holding, not what we asked it for. A sweep
+            // sprite whose pivot is its own centre hides every possible mistake here, because
+            // that is also LVGL's default after lv_img_set_src — so a pivot that never landed
+            // looks perfect until the day a sprite is trimmed and its pivot moves off centre.
+            {
+                lv_obj_update_layout(s_sweepImg);   // position is deferred; reading it first lies
+                lv_point_t got; lv_img_get_pivot(s_sweepImg, &got);
+                Serial.printf("[sweepimg] src %dx%d  asked pivot %d,%d  lvgl holds %d,%d  obj pos %d,%d size %dx%d  turns about %d,%d (want %d,%d)\n",
+                              (int)sweepSrc->header.w, (int)sweepSrc->header.h, spx, spy,
+                              (int)got.x, (int)got.y,
+                              (int)lv_obj_get_x(s_sweepImg), (int)lv_obj_get_y(s_sweepImg),
+                              (int)lv_obj_get_width(s_sweepImg), (int)lv_obj_get_height(s_sweepImg),
+                              (int)(lv_obj_get_x(s_sweepImg) + got.x), (int)(lv_obj_get_y(s_sweepImg) + got.y),
+                              scx, scy);
+            }
+        } else {
+            show(s_sweepImg, false);
+        }
+    }
+    // The "Overlay" card: plain color+opacity, no image — see s_dimLayer above.
+    if (s_dimLayer) {
+        const theme_style::Radar &rs2 = theme_style::radar();
+        if (rs2.overlayEnabled) {
+            lv_obj_set_style_bg_color(s_dimLayer, lv_color_hex(rs2.overlayColor), 0);
+            lv_obj_set_style_bg_opa(s_dimLayer, (lv_opa_t)rs2.overlayOpacity, 0);
+            show(s_dimLayer, true);
+        } else {
+            show(s_dimLayer, false);
+        }
+    }
+    // Merge the unchanging lower layers now that every one of them has been given
+    // its current source, position, scale and opacity. Runs last on purpose: it
+    // reads the finished state rather than trying to predict it, and it hides only
+    // what it has actually absorbed, so a failure here degrades to the live stack
+    // rather than to a missing layer.
+    rebuild_flat_background();
+    apply_grid_visibility();
+    applyRadarLayerOrder();
+}
+
+void update(const std::vector<Aircraft> &aircraft, const RadarSettings &s) {
+    std::vector<AcDraw> out;
+    out.reserve(aircraft.size());
+    std::set<std::string> present;
+    const float R = (float)RADAR_R_OUTER_PX;
+    ++s_flowGen;                                  // one tick per poll; flow segments age in these units
+    s_lastRangeKm = s.rangeKm;                    // kept current for the range banner (radar_range_fmt)
+
+    // Reproject the coastline only when the scope geometry actually changes (home
+    // moved or range zoomed) — never per frame. Then repaint the static chrome layer.
+    static double s_coLat = 1e9, s_coLon = 1e9; static float s_coRange = -1.0f;
+    if (s.homeLat != s_coLat || s.homeLon != s_coLon || s.rangeKm != s_coRange) {
+        const bool firstFix = (s_coRange < 0.0f);
+        s_coLat = s.homeLat; s_coLon = s.homeLon; s_coRange = s.rangeKm;
+        coastline_project(s.homeLat, s.homeLon, s.rangeKm, s_cx, s_cy, R);
+        airports_project(s.homeLat, s.homeLon, s.rangeKm, s_cx, s_cy, R);
+        roads_sd::project(s.homeLat, s.homeLon, s.rangeKm, s_cx, s_cy, R);
+        if (s_gridLayer) lv_obj_invalidate(s_gridLayer);
+        // The projection is new, so the etched copy is stale: render it once at the new
+        // geometry and fold it back into the flattened background. Costs one frame's
+        // worth of work on an event a person triggers rarely (move home, zoom range),
+        // and buys back the per-frame re-vectoring the rest of the time.
+        if (customStyled()) {
+            take_map_snapshot();
+            rebuild_flat_background();
+            apply_grid_visibility();
+        }
+        if (!firstFix) {
+            // Scope scale/center changed: old trails were plotted at the previous
+            // projection and would be wrong now — drop them and clear the flow layer.
+            s_trails.clear();
+            s_flow.clear();
+            flow_redraw_all();
+        }
+    }
+
+    std::map<std::string, lv_point_t> prevPos;        // smooth-motion: glide starts here
+    for (const AcDraw &a : s_acs) prevPos[a.hex] = a.pos;
+
+    for (const Aircraft &ac : aircraft) {
+        const double distKm = geo::haversineKm(s.homeLat, s.homeLon, ac.lat, ac.lon);
+        const double brg = geo::bearingDeg(s.homeLat, s.homeLon, ac.lat, ac.lon);
+        const geo::Point p = geo::projectToScreen(distKm, brg, s.rangeKm, s_cx, s_cy, R, s.rotationDeg);
+
+        AcDraw d;
+        lv_point_t target;
+        target.x = (lv_coord_t)lroundf(p.x);
+        target.y = (lv_coord_t)lroundf(p.y);
+        d.to = target;
+        {
+            auto pit = prevPos.find(std::string(ac.hex.c_str()));
+            if (pit != prevPos.end()) {
+                const long dx = (long)target.x - pit->second.x;
+                const long dy = (long)target.y - pit->second.y;
+                d.from = (dx * dx + dy * dy > 120L * 120L) ? target : pit->second;  // snap if it jumped
+            } else d.from = target;                                                  // new contact: appear in place
+        }
+#if MOTION_INTERP
+        // Custom designs GLIDE too, as of 2.9.5, and the comment that used to sit here was
+        // wrong. It argued that a custom design's PSRAM-backed alpha-composited layers make
+        // each interpolation step's invalidation far more expensive, so aircraft should snap
+        // to each polled position instead of gliding through it.
+        //
+        // Measured on Zion's Steam Punk face, A/B over 40 seconds each, with a counter
+        // watching what the glyphs actually did:
+        //
+        //   snapping:  49 steps per 5 s,  0 glyph moves,  0 px    9 fps
+        //   gliding:   49 steps per 5 s, 29 glyph moves, 30 px    9 fps
+        //
+        // Identical frame rate, no stalls either way, and the sweep's own spread figure
+        // showed no difference outside its noise. The claim assumed roughly 22 expensive
+        // recomposites between polls. What actually happens is about 29 moves of ONE PIXEL
+        // spread over five seconds, because an aircraft only crosses about 30 px of a 30 km
+        // scope in a whole poll. Tiny invalidation boxes, and the cost went with them.
+        //
+        // The line that follows this comment is why nobody had ever measured it: it disabled
+        // the code path the claim was about, so there was nothing running to be expensive.
+        // Overridable over the cable (?orb glide 1) so the claim above can be TESTED on a
+        // real custom theme rather than trusted. It is a performance claim about a code path
+        // that this same branch then disables, which means nothing has ever measured it on
+        // the hardware it describes. Worse, an attempt to measure it on 2026-09-04 by
+        // sweeping ?orb interpms found "no cost at all" on a Steam Punk face, which was true
+        // and meaningless: with from and to equal there was no glide to cost anything. The
+        // instrument was reading a code path the theme never enters.
+        const bool snap = (s_forceGlide < 0) ? false : (s_forceGlide == 0);
+        if (snap) { d.pos = target; d.from = target; }
+        else       d.pos = d.from;   // begin the glide at the previous position
+#else
+        d.pos = target;
+        d.from = target;
+#endif
+        d.inRange = p.inRange;
+        d.track = ac.track;
+        d.color = alt_color(ac.altBaro, ac.onGround);
+        d.emergency = acIsEmergency(ac.squawk);
+        snprintf(d.hex,  sizeof(d.hex),  "%s", ac.hex.c_str());
+        snprintf(d.call, sizeof(d.call), "%s", ac.flight.c_str());
+        snprintf(d.type, sizeof(d.type), "%s", ac.type.c_str());
+        d.altFt = ac.altBaro;
+        d.onGround = ac.onGround;
+        d.vsFpm = ac.baroRate;
+        d.gsKt = ac.gs;
+        d.distKm = (float)distKm;
+        d.bearingDeg = (float)brg;
+        d.squawk = ac.squawk;
+        // millis() and lv_tick_get() are the same clock on-device (lv_conf.h wires LVGL's
+        // tick straight to millis()), so this needs no unit conversion. A contact newer
+        // than "now" (clock wrapped, or the poll's stamp is momentarily ahead of this
+        // render) reads as freshness 1.0, not a negative age wrapping into "ancient."
+        {
+            const uint32_t nowMs = lv_tick_get();
+            const uint32_t ageMs = (nowMs >= ac.lastUpdateMs) ? (nowMs - ac.lastUpdateMs) : 0;
+            d.freshness = ac_freshness(ageMs);
+        }
+        if (ac.onGround) snprintf(d.altTxt, sizeof(d.altTxt), "GND");
+        else             snprintf(d.altTxt, sizeof(d.altTxt), "%.0f ft", (double)ac.altBaro);
+
+        const std::string key = ac.hex.c_str();
+        present.insert(key);
+        if (d.inRange) {
+            std::vector<lv_point_t> &hist = s_trails[key];
+            const bool moved = hist.empty() ||
+                               abs((int)hist.back().x - (int)target.x) > 0 ||
+                               abs((int)hist.back().y - (int)target.y) > 0;
+            if (moved) {
+                // Flow segments persist on their canvas once painted, so a segment laid
+                // down inside a zone would sit on the artwork for its entire lifetime.
+                // Tested here, at creation, rather than at draw time.
+                if (s_flowMax > 0 && !hist.empty() &&
+                    !in_excluded_zone(hist.back().x, hist.back().y) &&
+                    !in_excluded_zone(target.x, target.y)) {
+                    FlowSeg seg = { hist.back(), target, s_flowGen };
+                    s_flow.push_back(seg);
+                    while ((int)s_flow.size() > s_flowMax) s_flow.pop_front();
+                    flow_draw_seg(seg);
+                }
+                if (s_trailMax > 0) {
+                    hist.push_back(target);
+                    while ((int)hist.size() > s_trailMax) hist.erase(hist.begin());
+                } else {
+                    hist.clear();
+                }
+            }
+            d.trail = hist;
+        }
+        out.push_back(std::move(d));
+    }
+
+    for (auto it = s_trails.begin(); it != s_trails.end();) {
+        if (present.find(it->first) == present.end()) it = s_trails.erase(it);
+        else ++it;
+    }
+    if (!s_selHex.empty() && present.find(s_selHex) == present.end()) s_selHex.clear();
+
+    // Fade the flow layer by AGE, not just count: drop segments older than s_flowGenMax
+    // polls so old tracks self-clear even in busy airspace (a 5 nm view doesn't stay caked
+    // in green). If any were dropped, repaint the flow canvas so they actually disappear.
+    if (s_flowGenMax > 0 && !s_flow.empty()) {
+        // Expire old segments, but do NOT repaint on every prune.
+        //
+        // The flow canvas is additive, so removing a segment means clearing and redrawing
+        // every remaining one. That made one or two segments ageing out cost a full
+        // repaint of up to 700, measured at 210-330 ms ON THE RENDER THREAD — three-plus
+        // dropped frames, every poll, which is precisely the periodic stutter in the
+        // sweep. The work was wildly disproportionate to the change: repaint everything
+        // to remove two.
+        //
+        // So expiry is batched. Segments linger a little past their age limit until
+        // enough have accumulated to be worth one repaint. A trail tail fading a beat
+        // late is invisible; the sweep hitching is not, and Zion's stated priority is
+        // explicit that even motion wins.
+        size_t expired = 0;
+        while (expired < s_flow.size() &&
+               (uint16_t)(s_flowGen - s_flow[expired].gen) > (uint16_t)s_flowGenMax) {
+            ++expired;
+        }
+        const size_t batch = s_flow.size() / 6 > 12 ? s_flow.size() / 6 : 12;
+        // Repaint when a worthwhile batch has expired, or when everything has (the tail
+        // of a fade-out, where waiting for a batch that will never arrive would strand
+        // the last few segments on screen).
+        if (expired >= batch || (expired > 0 && expired == s_flow.size())) {
+            s_flow.erase(s_flow.begin(), s_flow.begin() + expired);
+            flow_redraw_all();
+        }
+    }
+
+    // Which aircraft the scope follows, and it is deliberately STICKY.
+    //
+    // This used to be "sort by distance, keep the nearest N", recomputed every poll. With
+    // a cap of five over a busy city that set churns constantly: two aircraft trade places
+    // by a kilometre and the scope drops one and adopts another on the far side of the
+    // dial. It reads as the instrument losing its mind rather than tracking anything.
+    //
+    // So a contact keeps its slot for as long as it stays trackable, and a slot only opens
+    // when the aircraft in it leaves the ring or lands. Free slots are then filled by the
+    // nearest untracked contact. The instrument follows aircraft instead of re-deciding
+    // what is interesting twice a second.
+    std::sort(out.begin(), out.end(),
+              [](const AcDraw &a, const AcDraw &b) { return a.distKm < b.distKm; });
+    // Counted BEFORE the cap below trims `out`, which is the whole point: the interesting
+    // number is how many candidates existed, not how many survived.
+    int dbgInRange = 0, dbgFlying = 0;
+    for (const AcDraw &a : out) if (a.inRange) { ++dbgInRange; if (!a.onGround) ++dbgFlying; }
+    if ((int)out.size() > s_maxOnScreen) {
+        // Trackable means on the scope and flying. Ground traffic is never worth a slot,
+        // and the feed already drops it when hide-ground or a minimum altitude is set —
+        // this is the backstop for when neither is.
+        auto trackable = [](const AcDraw &a) { return a.inRange && !a.onGround; };
+        // Confirmed within the last AC_DIM_START_MS, i.e. not yet dimming. A contact that
+        // has gone quiet for longer than that must never hold a slot a genuinely current
+        // one needs — the aging/dimming display below is what keeps it visible while there
+        // IS room, not a claim on room when there is not.
+        auto current = [](const AcDraw &a) { return a.freshness >= 1.0f; };
+
+        std::vector<AcDraw> kept;
+        kept.reserve(s_maxOnScreen);
+        for (const AcDraw &a : out) {                       // current incumbents first, nearest first
+            if ((int)kept.size() >= s_maxOnScreen) break;
+            if (!trackable(a) || !current(a)) continue;
+            if (s_tracked.find(std::string(a.hex)) != s_tracked.end()) kept.push_back(a);
+        }
+        for (const AcDraw &a : out) {                       // then backfill with new, current arrivals
+            if ((int)kept.size() >= s_maxOnScreen) break;
+            if (!trackable(a) || !current(a)) continue;
+            if (s_tracked.find(std::string(a.hex)) == s_tracked.end()) kept.push_back(a);
+        }
+        for (const AcDraw &a : out) {                       // only THEN spend a slot on an aging contact
+            if ((int)kept.size() >= s_maxOnScreen) break;
+            if (!trackable(a) || current(a)) continue;
+            kept.push_back(a);
+        }
+        // Only if nothing qualified: better to show distant or grounded contacts than an
+        // empty scope, which would look broken rather than quiet.
+        if (kept.empty()) { out.resize(s_maxOnScreen); }
+        else              { out.swap(kept); }
+    }
+    s_tracked.clear();
+    for (const AcDraw &a : out) s_tracked.insert(std::string(a.hex));
+
+    // Why the dial shows what it shows. Added 2026-08-22: the theme asked for 14 aircraft
+    // and five appeared, and every explanation for that gap was a guess. These are the four
+    // numbers that actually decide it — what the feed sent, how many fell inside the ring,
+    // how many of those were flying, and how many survived the cap — so the answer is read
+    // rather than reasoned about. Throttled to one line every ~10 s.
+    {
+        // lv_tick_get(), not millis(): this file also builds for the desktop simulator,
+        // where millis() does not exist. LVGL's tick is available in both.
+        static uint32_t s_acDbgAt = 0;
+        if (lv_tick_get() - s_acDbgAt > 10000) {
+            s_acDbgAt = lv_tick_get();
+            // "table" is aircraft.size(): the persistent count, fresh entries plus anything
+            // still aging out from an earlier poll. "dimming" is how many of THOSE are below
+            // full freshness right now — the direct, printable proof that a contact is
+            // being retained and faded rather than dropped the instant one poll misses it.
+            int dimming = 0;
+            for (const AcDraw &a : out) if (a.freshness < 0.999f) ++dimming;
+            Serial.printf("[acdbg] table=%u inRange=%d flying=%d drawn=%u dimming=%d cap=%d rangeKm=%.0f\n",
+                          (unsigned)aircraft.size(), dbgInRange, dbgFlying,
+                          (unsigned)out.size(), dimming, s_maxOnScreen, (double)s.rangeKm);
+        }
+    }
+
+    if (++s_flowRedrawCtr >= FLOW_REDRAW_EVERY) {
+        s_flowRedrawCtr = 0;
+        flow_redraw_all();
+    }
+
+    if (s_rangeLbl) {                                 // keep the range label in sync with settings
+        char r[16];
+        snprintf(r, sizeof(r), "%.0f km", (double)s.rangeKm);
+        lv_label_set_text(s_rangeLbl, r);
+    }
+
+    const uint32_t now = lv_tick_get();              // measure actual cadence for the glide clock
+    s_pollMs = (s_lastUpdateMs && now > s_lastUpdateMs) ? (now - s_lastUpdateMs) : (uint32_t)POLL_INTERVAL_MS;
+    // The CEILING WAS BELOW THE POLL INTERVAL, so the normal case always hit it.
+    //
+    // Polls land about every 10.4 s against a nominal POLL_INTERVAL_MS of 10000, and the
+    // glide clock was clipped to 8000. So every aircraft finished its whole journey two and
+    // a half seconds before the next position arrived and then sat perfectly still waiting
+    // for it. Combined with the ease-out below, which had them 94% of the way there by
+    // t=0.75, the visible result was a lurch followed by four or five seconds of nothing:
+    // "they jump every about 10 or 11 seconds", which is the poll interval exactly.
+    //
+    // A ceiling is still right, because a missed poll should not turn into a half-minute
+    // crawl. It just has to sit ABOVE the interval it is bounding rather than below it. This
+    // is the same fault as the sweep's stall clamp feeding its own statistics: a guard set
+    // to protect something quietly became the thing damaging it.
+    if (s_pollMs < 400) s_pollMs = 400;
+    const uint32_t glideMax = (uint32_t)POLL_INTERVAL_MS + (uint32_t)POLL_INTERVAL_MS / 2;
+    if (s_pollMs > glideMax) s_pollMs = glideMax;
+    s_lastUpdateMs = now;
+    s_animStartMs  = now;
+
+    s_acs = std::move(out);
+    // The scope has real content now: the projection and etch above are done and this
+    // snapshot is live. Dismissing here rather than on a timer means the notice lasts
+    // exactly as long as the wait actually lasts.
+    if (s_loadingPending) {
+        s_loadingPending = false;
+        if (s_loading)    show(s_loading, false);
+        if (s_loadTicker) show(s_loadTicker, false);
+        // Mirrors refreshCustomStyle's condition for the image sweep: it is visible only
+        // when a custom design asks for the image type AND actually ships the sprite.
+        if (s_sweepImg && customStyled() && theme_style::radar().sweepTypeImage && radar_custom_sweep())
+            show(s_sweepImg, true);
+        if (s_sweep) lv_obj_invalidate(s_sweep);
+    }
+    if (s_acLayer) lv_obj_invalidate(s_acLayer);
+    refresh_custom_text();   // live values (alt/spd/dist/...) for the current selection, if any, just changed
+}
+
+int hitTest(int x, int y) {
+    int best = -1;
+    long bestD = (long)TAP_RADIUS_PX * TAP_RADIUS_PX;
+    const bool drg = orb();
+    int balls = 0, arrows = 0;
+    for (size_t i = 0; i < s_acs.size(); ++i) {
+        if (drg) {
+            if (s_acs[i].inRange) { if (balls >= ORB_BLIPS) continue; balls++; }
+            else { if (arrows >= ORB_ARROWS) continue; arrows++; }
+        } else if (!s_acs[i].inRange) continue;
+        const long dx = (long)s_acs[i].pos.x - x;
+        const long dy = (long)s_acs[i].pos.y - y;
+        const long dd = dx * dx + dy * dy;
+        if (dd <= bestD) { bestD = dd; best = (int)i; }
+    }
+    return best;
+}
+
+static void fill_info(const AcDraw &a, AcInfo &out) {
+    snprintf(out.hex, sizeof(out.hex), "%s", a.hex);
+    snprintf(out.call, sizeof(out.call), "%s", a.call);
+    snprintf(out.type, sizeof(out.type), "%s", a.type);
+    out.altFt = a.altFt; out.onGround = a.onGround;
+    out.vsFpm = a.vsFpm; out.gsKt = a.gsKt;
+    out.distKm = a.distKm; out.bearingDeg = a.bearingDeg;
+    out.squawk = a.squawk; out.emergency = a.emergency;
+}
+
+#if CUSTOM_HAS_RADAR
+// Substitute {token} placeholders against one aircraft's live info — the exact
+// same token set the Launch Kit editor's own radarFmt()/radarTokens() use, so a
+// format string written there means the same thing here. {from}/{to} come from
+// the same async route lookup the native detail card already uses.
+// The parser moved to text_tokens.cpp when the Weather map got text slots of its own, so
+// both screens walk a format string the same way. These two names stay because they are
+// spelled all over this file and mean exactly what they always did.
+using RadarTok = text_tokens::Tok;
+static inline void radar_fmt_toks(char *out, size_t outSz, const char *fmt, const RadarTok *toks, size_t nToks) {
+    text_tokens::expand(out, outSz, fmt, toks, nToks);
+}
+// Returns false (leaves `out` empty) when the format needs {from}/{to} and the
+// route lookup hasn't produced both yet — the caller skips drawing that banner
+// entirely rather than showing a "?" placeholder while it's still resolving (or
+// blank/half-blank if this particular callsign genuinely has no route on file).
+static bool radar_fmt(char *out, size_t outSz, const char *fmt, const AcInfo &in) {
+    char altS[16], spdS[16], distS[16], hdgS[8], sqkS[8];
+    snprintf(altS, sizeof(altS), "%.0f", (double)in.altFt);
+    snprintf(spdS, sizeof(spdS), "%.0f", (double)(isnan(in.gsKt) ? 0.0f : in.gsKt));
+    snprintf(distS, sizeof(distS), "%.1f", (double)in.distKm);
+    snprintf(hdgS, sizeof(hdgS), "%.0f", (double)in.bearingDeg);
+    if (in.squawk < 0) snprintf(sqkS, sizeof(sqkS), "-");
+    else                snprintf(sqkS, sizeof(sqkS), "%04d", in.squawk);
+    const bool needsRoute = strstr(fmt, "{from}") || strstr(fmt, "{to}");
+    char rfrom[40] = "", rto[40] = "";
+    if (needsRoute && in.call[0]) {
+        route_request(in.call);
+        route_get(in.call, rfrom, sizeof(rfrom), rto, sizeof(rto));
+        // The moment a route first completes for the aircraft on screen, restart the idle
+        // countdown. This runs on the LVGL task (route_store does not), so the timer is
+        // touched from the same task that reads it. Without this the route could arrive
+        // with a second left on the clock and vanish as it registered — the card looking
+        // "too fast" when really the text had only just turned up.
+        static char s_routeShownFor[12] = "";
+        if (rfrom[0] && rto[0] && strncmp(s_routeShownFor, in.call, sizeof(s_routeShownFor) - 1) != 0) {
+            snprintf(s_routeShownFor, sizeof(s_routeShownFor), "%s", in.call);
+            noteSelectionDetailArrived();
+        }
+    }
+    if (needsRoute && (!rfrom[0] || !rto[0])) { if (outSz) out[0] = 0; return false; }
+    RadarTok toks[] = {
+        { "callsign", in.call[0] ? in.call : "-" }, { "type", in.type },
+        { "alt", altS }, { "spd", spdS }, { "dist", distS }, { "hdg", hdgS }, { "sqk", sqkS },
+        { "from", rfrom }, { "to", rto },
+    };
+    radar_fmt_toks(out, outSz, fmt, toks, sizeof(toks) / sizeof(toks[0]));
+    return true;
+}
+// The scope-range banner: describes the radar's own configured radius (the
+// Range slider), not a selected aircraft — always shown when CUSTOM_HAS_RTEXT4,
+// regardless of selection. s_lastRangeKm (declared near the other statics
+// above) is kept current by update().
+static void radar_range_fmt(char *out, size_t outSz, const char *fmt) {
+    char rangeS[16]; snprintf(rangeS, sizeof(rangeS), "%.0f", (double)s_lastRangeKm);
+    RadarTok toks[] = { { "range", rangeS } };
+    radar_fmt_toks(out, outSz, fmt, toks, 1);
+}
+// The location banner: what the place under the crosshair is CALLED. THEME_CAPS 54.
+//
+// No lookup and no city table. host_location_name() reads back the name that was saved
+// alongside the coordinates by whichever path set them, so this costs a string read.
+//
+// Returns false when nothing has ever named this position, and the caller then draws
+// nothing at all: a themed plate with an empty middle is worse than an absent line, and a
+// device given bare coordinates over ?orb setloc genuinely does not know where it is.
+static bool radar_loc_fmt(char *out, size_t outSz, const char *fmt) {
+    char city[48] = "";
+    if (!host_location_name(city, sizeof(city))) { if (outSz) out[0] = 0; return false; }
+    RadarTok toks[] = { { "city", city } };
+    radar_fmt_toks(out, outSz, fmt, toks, 1);
+    return out[0] != 0;
+}
+// Selection banners render into their own transparent canvas (s_textCanvas), not LVGL
+// labels — that is what lets a banner curve along an arc (LVGL has no curved-text
+// primitive) and glow (canvas shadowBlur is not a firmware effect either).
+//
+// Both are drawn by the shared curved_text primitive.
+//
+// This file used to carry its own copy of the glyph-rotation and arc-layout maths, which
+// was itself copied out of clock_view.cpp. The Headlines screen wanting the same thing made
+// that two copies about to become three, so it moved to curved_text.cpp and this is now the
+// call site rather than a third implementation. The arithmetic there is byte for byte what
+// was here: these banners are tuned against designs that already exist.
+static void rtext_draw_curved(const lv_font_t *font, const char *str, float R, float arcDeg,
+                              lv_color_t col, int glow, lv_color_t glowCol, lv_opa_t opa) {
+    const curved_text::Target dst = { (uint8_t *)s_textBuf, SCREEN_W, SCREEN_H };
+    curved_text::draw_arc(dst, font, str, (float)s_cx, (float)s_cy, R, arcDeg, col, glow, glowCol, opa);
+}
+
+static void rtext_draw_straight(const lv_font_t *font, const char *str, float bx, float by,
+                                lv_color_t col, int glow, lv_color_t glowCol, int align, lv_opa_t opa,
+                                const curved_text::Pill &pill = curved_text::Pill()) {
+    const curved_text::Target dst = { (uint8_t *)s_textBuf, SCREEN_W, SCREEN_H };
+    curved_text::draw_straight(dst, font, str, bx, by, col, glow, glowCol, align, opa, pill);
+}
+
+// Refresh the 4 selection banners for whatever's currently selected — the
+// canvas is cleared fully transparent when nothing is, so a design with no
+// aircraft picked shows a clean scope, matching the editor's own show/hide.
+static void refresh_custom_text() {
+    if (!s_textCanvas) return;
+    AcInfo in;
+    const bool have = selected(in);
+    const theme_style::Radar &rs = theme_style::radar();
+    // `show` is the gate now, not CUSTOM_HAS_RTEXT{n}.
+    //
+    // Those macros are baked in by whichever Launch Kit push last compiled the firmware,
+    // so a theme installed as FILES ALONE — which is every theme Orb Studio makes — could
+    // ship a selection line and have the Orb refuse to draw it, for no reason it could see
+    // or state. Exactly the bug the clock's own text1/text2 had (see clock_view.cpp), and
+    // exactly the same fix: the theme decides, at runtime.
+    bool need = false;
+    if (have) for (int i = 0; i < 3; ++i) if (rs.rtext[i].show) need = true;
+    if (rs.rtext[3].show) need = true;   // the range banner is scope-wide, selection or not
+    if (rs.locText.show) need = true;    // and so is the location banner (THEME_CAPS 54)
+    // The card, and where it sits. Placed before the text so the banners riding it have a
+    // centre to be measured from.
+    //
+    // Always 180 degrees from the selected aircraft's own bearing: the thing just picked is
+    // never underneath the words describing it, however the traffic moves. Recomputed on
+    // every refresh, which is also every position update, so the card chases the far side
+    // of the dial live rather than being placed once and left there.
+    float cardCx = (float)s_cx, cardCy = (float)s_cy;
+    const bool cardOn = rs.card.enabled && have;
+    if (cardOn) {
+        const float opp = (in.bearingDeg + 180.0f) * (float)M_PI / 180.0f;
+        cardCx = (float)s_cx + sinf(opp) * (float)rs.card.radius;
+        cardCy = (float)s_cy - cosf(opp) * (float)rs.card.radius;
+    }
+    if (s_cardImg && s_cardObj) {
+        const lv_img_dsc_t *art = (cardOn && rs.card.typeImage) ? radar_custom_card() : nullptr;
+        if (art) {
+            lv_img_set_src(s_cardImg, art);
+            lv_obj_set_pos(s_cardImg, (lv_coord_t)lroundf(cardCx - art->header.w / 2.0f),
+                                      (lv_coord_t)lroundf(cardCy - art->header.h / 2.0f));
+            lv_obj_set_style_img_opa(s_cardImg, (lv_opa_t)rs.card.opacity, 0);
+            show(s_cardImg, true);
+            show(s_cardObj, false);
+        } else if (cardOn) {
+            // Drawn card, or an image card whose art failed to decode: a plate is better
+            // than words floating over the scope with nothing behind them.
+            lv_obj_set_size(s_cardObj, (lv_coord_t)rs.card.w, (lv_coord_t)rs.card.h);
+            lv_obj_set_pos(s_cardObj, (lv_coord_t)lroundf(cardCx - rs.card.w / 2.0f),
+                                      (lv_coord_t)lroundf(cardCy - rs.card.h / 2.0f));
+            lv_obj_set_style_bg_color(s_cardObj, lv_color_hex(rs.card.color), 0);
+            lv_obj_set_style_bg_opa(s_cardObj, (lv_opa_t)rs.card.opacity, 0);
+            lv_obj_set_style_radius(s_cardObj, (lv_coord_t)rs.card.corner, 0);
+            lv_obj_set_style_border_color(s_cardObj, lv_color_hex(rs.card.borderColor), 0);
+            lv_obj_set_style_border_width(s_cardObj, (lv_coord_t)rs.card.borderWidth, 0);
+            lv_obj_set_style_border_opa(s_cardObj, LV_OPA_COVER, 0);
+            show(s_cardObj, true);
+            show(s_cardImg, false);
+        } else {
+            show(s_cardObj, false);
+            show(s_cardImg, false);
+        }
+    }
+    if (!need) { canvas_release(s_textCanvas, s_textBuf); return; }
+    if (!canvas_acquire(s_textCanvas, s_textBuf, "text")) return;
+    lv_canvas_fill_bg(s_textCanvas, lv_color_black(), LV_OPA_TRANSP);
+    // CUSTOM_HAS_RTEXT{n} (whether this banner exists at all) and each FONT stay
+    // compile-time (see theme_style.h); position/color/glow/format/align/curve now
+    // follow the active SD theme.
+    if (have) {
+        for (int i = 0; i < 3; ++i) {
+            const theme_style::RadarText &t = rs.rtext[i];
+            if (!t.show) continue;
+            char buf[64];
+            if (!radar_fmt(buf, sizeof(buf), t.fmt, in)) continue;
+            // After the tokens, not before: {callsign} is UAL328 by now. THEME_CAPS 53.
+            if (t.upper) orb_upper(buf);
+            if (t.curved) { rtext_draw_curved(theme_font::radar_text(i), buf, (float)t.curveR, t.arcDeg, lv_color_hex(t.color), t.glow, lv_color_hex(t.glowColor), (lv_opa_t)t.opa); continue; }
+            // A line riding the card reads x/y as an offset from the card's own centre, so
+            // it travels with it. Only when a card is actually showing: a line pinned to a
+            // card that is switched off would otherwise land at an offset from the middle
+            // of the scope, which is not where anyone put it.
+            const float lx = (t.onCard && cardOn) ? cardCx + (float)(t.x - SCREEN_W / 2) : (float)t.x;
+            const float ly = (t.onCard && cardOn) ? cardCy + (float)(t.y - SCREEN_H / 2) : (float)t.y;
+            rtext_draw_straight(theme_font::radar_text(i), buf, lx, ly, lv_color_hex(t.color), t.glow, lv_color_hex(t.glowColor), t.align, (lv_opa_t)t.opa, curved_text::pill_of(t));
+        }
+    }
+    // The range banner describes the scope itself (its configured radius), not a
+    // selected aircraft, so it's outside the `have` gate above — it stays on the
+    // whole time a custom design is active, matching the editor's own preview.
+    if (rs.rtext[3].show) {
+      const theme_style::RadarText &t = rs.rtext[3];
+      char buf[64]; radar_range_fmt(buf, sizeof(buf), t.fmt);
+      if (t.upper) orb_upper(buf);   // THEME_CAPS 53
+      if (t.curved) rtext_draw_curved(theme_font::radar_text(3), buf, (float)t.curveR, t.arcDeg, lv_color_hex(t.color), t.glow, lv_color_hex(t.glowColor), (lv_opa_t)t.opa);
+      else rtext_draw_straight(theme_font::radar_text(3), buf, (float)t.x, (float)t.y, lv_color_hex(t.color), t.glow, lv_color_hex(t.glowColor), t.align, (lv_opa_t)t.opa, curved_text::pill_of(t));
+    }
+    // The location banner, on the same terms as the range banner above: it describes the
+    // scope, not a selection, so it is outside the `have` gate and stays up the whole time.
+    // Drawn last of the five, which only matters where a design overlaps them.
+    if (rs.locText.show) {
+      const theme_style::RadarText &t = rs.locText;
+      char buf[80];
+      if (radar_loc_fmt(buf, sizeof(buf), t.fmt)) {
+        if (t.upper) orb_upper(buf);   // THEME_CAPS 53, same as every other line
+        if (t.curved) rtext_draw_curved(theme_font::radar_loc(), buf, (float)t.curveR, t.arcDeg, lv_color_hex(t.color), t.glow, lv_color_hex(t.glowColor), (lv_opa_t)t.opa);
+        else rtext_draw_straight(theme_font::radar_loc(), buf, (float)t.x, (float)t.y, lv_color_hex(t.color), t.glow, lv_color_hex(t.glowColor), t.align, (lv_opa_t)t.opa, curved_text::pill_of(t));
+      }
+    }
+    lv_obj_invalidate(s_textCanvas);
+}
+#else
+static void refresh_custom_text() {}
+#endif
+
+void select(int idx) {
+    if (idx < 0 || idx >= (int)s_acs.size()) s_selHex.clear();
+    else s_selHex = s_acs[idx].hex;
+    if (s_acLayer) lv_obj_invalidate(s_acLayer);
+    refresh_custom_text();
+}
+
+// Cycle through in-range aircraft, with an explicit "none selected" stop at
+// position 0 so turning wraps all the way back around to it. Builds the
+// in-range list fresh each call (aircraft come and go every poll), finds where
+// the current selection sits in it (or the "none" stop if nothing/no-longer
+// in range), and steps by dir with wraparound.
+void selectNext(int dir) {
+    std::vector<int> inRangeIdx;
+    // Masked aircraft are excluded from the knob's cycle: landing a selection on a
+    // contact the person cannot see reads as the knob doing nothing.
+    for (int i = 0; i < (int)s_acs.size(); ++i)
+        if (s_acs[i].inRange && !ac_masked(s_acs[i])) inRangeIdx.push_back(i);
+    const int n = (int)inRangeIdx.size();
+    if (n == 0) { select(-1); return; }
+    int pos = 0;   // 0 = "none"; 1..n = inRangeIdx[pos-1]
+    if (!s_selHex.empty()) {
+        for (int k = 0; k < n; ++k) if (s_acs[inRangeIdx[k]].hex == s_selHex) { pos = k + 1; break; }
+    }
+    pos = ((pos + dir) % (n + 1) + (n + 1)) % (n + 1);
+    select(pos == 0 ? -1 : inRangeIdx[pos - 1]);
+}
+
+// --- Flight Tracker knob handlers (wired identically by the device + simulator) ---
+
+// onEnter tail: re-attach the pushed plate/overlay (freed on the last onExit) and
+// land in the DEFAULT VIEW — nothing selected, knob released, so a turn opens the
+// app switcher. A push is what enters selection mode (knobPress below). Unconditional
+// now that knobPress() always supports selection mode (not gated on CUSTOM_HAS_RADAR
+// any more) — this reset has to run every entry regardless, or stale selection state
+// from a prior visit could leak through in a stock (no custom design) build.
+void knobEnter() {
+    refreshCustomStyle();
+    s_selectMode = false;
+    select(-1);
+    app_shell::setCaptured(false);
+    // Data now polls continuously from boot (see main.cpp's adsb_task), so this banner can
+    // already be primed to fire the instant the screen appears: staleness kept accumulating
+    // the whole time nobody was here to see it. setFeedStatus() re-evaluates on its own
+    // very next tick and will show it again if the feed genuinely is still down, but that
+    // is a fresh, honest read taken now, not a verdict reached before this screen existed.
+    if (s_feedWarn) show(s_feedWarn, false);
+    // Only when there is actually nothing on the scope. Coming back to a Flight Tracker
+    // that still holds its last snapshot has nothing to wait for, and flashing a loading
+    // notice over a working display would be its own kind of lie.
+    if (s_acs.empty()) {
+        s_loadingPending = true;
+        s_loadStartMs = lv_tick_get();
+        s_loadShownSec = -1;
+        if (s_loading) { show(s_loading, true); lv_obj_move_foreground(s_loading); }
+        if (s_sweepImg) show(s_sweepImg, false);
+        if (s_sweep)    lv_obj_invalidate(s_sweep);   // clear the vector wedge's last frame
+    }
+}
+
+// Push: toggle selection. From the default view it grabs the knob and selects the
+// first in-range aircraft (nothing to select -> stays in the default view). From
+// selection mode it drops straight back to the default view (the manual version of
+// the 5s idle timeout). Aircraft selection doesn't depend on a custom design being
+// active — it used to be stock-only-vs-cycle-the-scope-skin here, but that legacy
+// theme-cycle gesture was a hidden, undiscoverable knob-press with no Settings entry
+// at all, confusingly named the same as actual Launch Kit themes. Retired in favor of
+// the real Settings "Design" picker (theme_select) — see its header for why.
+// Nothing. Selecting an aircraft is what a TURN does now, so the button has no job on this
+// screen, and giving it a second way to do the same thing would only invite the question of
+// what the difference is. Left as an empty handler rather than unregistered so the shape of
+// the app table stays readable.
+void knobPress() {}
+
+// A turn selects. Straight in, with no press to arm it first.
+//
+// This used to be a mode you entered by pressing: press to take the knob, turn to step
+// through aircraft, press again to leave. That put the one thing people most want to do on
+// this screen behind a button that takes real force, and made a turn — the obvious gesture
+// on a dial — do nothing at all until it had been asked permission.
+//
+// The first turn from nothing selected picks the nearest contact rather than stepping from
+// an arbitrary index, so the box lands somewhere sensible. After SELECT_IDLE_MS of stillness
+// it clears itself; the Rock gesture leaves the app entirely and clears it on the way out.
+void knobTurn(int dir) {
+    if (!s_selectMode) {
+        if (countInRange() <= 0) return;   // an empty sky has nothing to select
+        s_selectMode = true;
+        selectNext(1);
+    } else {
+        selectNext(dir > 0 ? 1 : -1);
+    }
+    s_selActivityMs = lv_tick_get();
+}
+
+// onExit: free the decoded plate/overlay PSRAM and drop selection mode so the idle
+// timer can't fire against a scope that's no longer on screen.
+void knobExit() {
+    radar_sprite_release();
+    s_selectMode = false;
+    s_loadingPending = false;
+    if (s_loading)    show(s_loading, false);    // never leave it stranded over another app
+    if (s_loadTicker) show(s_loadTicker, false); // same for its elapsed-time line
+    if (s_feedWarn)   show(s_feedWarn, false);   // same for the feed banner
+}
+
+bool selected(AcInfo &out) {
+    if (s_selHex.empty()) return false;
+    for (const AcDraw &a : s_acs)
+        if (s_selHex == a.hex) { fill_info(a, out); return true; }
+    return false;
+}
+
+int count() { return (int)s_acs.size(); }
+
+int countInRange() {
+    int n = 0;
+    for (const AcDraw &a : s_acs) if (a.inRange) ++n;
+    return n;
+}
+
+bool info(int idx, AcInfo &out) {
+    if (idx < 0 || idx >= (int)s_acs.size()) return false;
+    fill_info(s_acs[idx], out);
+    return true;
+}
+
+void tickSweep() { /* sweep self-animates via lv_timer */ }
+
+// Late detail landed on a card that is still up: give the reader a full window from now,
+// rather than whatever was left of the one that started when they turned the knob.
+// Say WHICH thing is unwell, because from the desk a blank scope looks identical whether
+// the WiFi dropped, the firmware wedged, or somebody else's server is having a bad night —
+// and the last of those is by far the likeliest. The device knows which it is, so it should
+// say so rather than leave a person guessing at their own hardware.
+//
+// Only after a real gap: aircraft arrive every ten seconds and a single missed poll is
+// normal, so warning at the first hiccup would train people to ignore this.
+void setFeedStatus(bool wifiUp, uint32_t staleSec, bool locationKnown) {
+    if (!s_feedWarn) return;
+    // No location is not a thing that waiting fixes, so it DISMISSES the loading notice
+    // instead of queueing behind it.
+    //
+    // Without this the two states deadlock, and it is the deadlock that matters: the notice
+    // is raised by knobEnter() whenever the scope is empty, and cleared only by update(),
+    // which runs when a poll delivers a snapshot. The poll is gated on having a location.
+    // So an Orb that does not know where it is can never clear the notice, and the early
+    // return below meant the one message that explains why was suppressed by it. The screen
+    // said "Loading aircraft and location data" with a counter ticking upward, for ever,
+    // which is exactly the open-ended wait the charter forbids under S1 — and it was worse
+    // than the plain bug, because the label is deliberately theme-proof so nothing could
+    // style it away either.
+    //
+    // Clearing the flag also releases the sweep (sweep_timer_cb returns early while it is
+    // set), so the dial turns over an empty scope with the banner on it. That is the right
+    // picture: the instrument is alive, the sky is not the problem, and the words say so.
+    if (!locationKnown && s_loadingPending) {
+        s_loadingPending = false;
+        if (s_loading)    show(s_loading, false);
+        if (s_loadTicker) show(s_loadTicker, false);
+    }
+    // While the big "Loading" box is still up it is already saying this, in more words.
+    if (s_loadingPending) { show(s_feedWarn, false); return; }
+    // STATE ONLY, NEVER A CAUSE.
+    //
+    // This used to say "WiFi is fine, the service is not answering". Measured 2026-08-23 while
+    // that exact sentence was on the dial: the service answered a laptop in 1.3 s with 88
+    // aircraft, and the Orb itself was unreachable over WiFi. Both halves were wrong.
+    //
+    // The bug was claiming a diagnosis from WiFi.status(), which only reports that the radio
+    // is ASSOCIATED with an access point. It says nothing about whether the device can
+    // actually use the network — and when internal memory is exhausted it cannot, while
+    // still reporting WL_CONNECTED. So the banner asserted the one thing it had no way to
+    // know, and asserted it confidently.
+    //
+    // An indicator that names the wrong culprit is worse than none: it sends a person to
+    // check their router while the fault is somewhere else entirely, and once it has done
+    // that twice nothing it says is believed again. So it now reports only what is directly
+    // observable — no fresh aircraft — and leaves the diagnosis to the logs, which can be
+    // checked rather than trusted.
+    const char *msg = nullptr;
+    // Same clock the contacts themselves age on (AC_DIM_START_MS, config.h), not a second
+    // number chosen independently. They used to disagree — 45s here, 60s for the first
+    // visible dimming — so for 15 real seconds the feed could be exactly stale enough to
+    // trip this banner while every aircraft on the dial was still drawn at full brightness,
+    // which read as the instrument flatly contradicting itself: "no data" over a screen
+    // full of normal-looking traffic. This is the fix Zion found live, on the device,
+    // 2026-08-24. One clock, so the banner and the first dimmed pixel can never disagree
+    // about whether anything is stale.
+    //
+    // Location outranks staleness, and is checked first for that reason. With no centre
+    // there is nothing to query and therefore never any traffic, so "No aircraft data"
+    // would be perfectly true and completely useless — it describes the symptom of a
+    // device that does not know where it is, and sends the reader to look at the feed.
+    // This still obeys the rule above: whether a location has ever been established is a
+    // fact read straight out of NVS, not a diagnosis of anything.
+    //
+    // THREE STATES, NOT ONE, and that is UX-066: a dead connection, a dead feed and a
+    // device that does not know where it is are three different problems with three
+    // different things to do about them, and until now the last two both said "No aircraft
+    // data". wifiUp has been a parameter of this function the whole time and was never once
+    // read — the caller measured it, passed it in, and the message ignored it.
+    //
+    // Naming adsb.lol does NOT break the rule above, and the distinction is worth being
+    // exact about. What was wrong before was asserting a CAUSE that had not been observed:
+    // "WiFi is fine, the service is not answering" claimed two things the device had no way
+    // to know, and both were false at the time. "adsb.lol is not answering" claims one
+    // thing the device did observe directly — it asked that host, repeatedly, and has had
+    // nothing back for as long as the contacts have been ageing. It does not say why, and
+    // it does not say whose fault it is.
+    //
+    // UX-039's test is whether the owner can tell a dead internet connection from one dead
+    // feed by reading the screen. With one message for both, they could not.
+    if (!wifiUp)             msg = "No WiFi\nYour Orb is fine";
+    else if (!locationKnown) msg = "Location not set\nSettings " LV_SYMBOL_RIGHT " Location";
+    else if (staleSec >= ADSB_NO_DATA_MS / 1000) msg = "No aircraft data\n" ADSB_SOURCE_NAME " is not answering";
+    // Log only on change: this is called every status tick, and a line per tick would bury
+    // the feed diagnostics underneath it.
+    static const char *s_shown = nullptr;
+    if (!msg) {
+        if (s_shown) { Serial.println("[feedwarn] cleared"); s_shown = nullptr; }
+        show(s_feedWarn, false);
+        return;
+    }
+    if (s_shown != msg) {
+        s_shown = msg;
+        Serial.printf("[feedwarn] showing: %s (stale %lus)\n", msg, (unsigned long)staleSec);
+    }
+    lv_label_set_text(s_feedWarn, msg);
+    show(s_feedWarn, true);
+    lv_obj_move_foreground(s_feedWarn);
+}
+
+void setSweepFrameMs(uint32_t ms) {
+    const uint32_t use = ms ? ms : (uint32_t)SWEEP_FRAME_MS;
+    if (s_timer) lv_timer_set_period(s_timer, (uint32_t)use);
+    // Reseed the pacing state so the first step after a change is measured from now rather
+    // than from a gap that belongs to the old period.
+    s_lastSweepMs = 0;
+    s_emaDtMs = 0.0f;
+    Serial.printf("[sweep] frame period -> %lu ms\n", (unsigned long)use);
+}
+
+// How often aircraft glyphs are allowed to move, live, for measuring what a faster glide
+// costs. Zero restores AC_INTERP_MS. An instrument, not a setting: nothing persists it, so a
+// reboot puts the product decision back.
+void setAcInterpMs(uint32_t ms) {
+    s_acInterpMs = ms;
+    Serial.printf("[radar] glide cadence -> %lu ms%s\n",
+                  (unsigned long)(ms ? ms : (uint32_t)AC_INTERP_MS), ms ? "" : " (default)");
+}
+
+// Force the glide on or off regardless of the theme, for measuring what it costs on a
+// custom design. -1 restores the compiled behaviour.
+// Smooth filtering on the rotated sweep image, on or off, live. For proving whether it is
+// the cost rather than assuming it: the same trend can appear in two runs for reasons that
+// have nothing to do with the change, and a single before-and-after cannot tell them apart.
+void setTrailSteps(int n) {
+    s_forceTrailSteps = n;
+    Serial.printf("[radar] trail lines -> %s%d\n", n > 0 ? "" : "the design's own, currently ", 
+                  n > 0 ? n : theme_style::radar().sweepTrailSteps);
+}
+
+void setSweepAA(int on) {
+    if (s_sweepImg) lv_img_set_antialias(s_sweepImg, on != 0);
+    Serial.printf("[radar] sweep antialias -> %s (image sweep %s)\n",
+                  on ? "on" : "off",
+                  (customStyled() && theme_style::radar().sweepTypeImage) ? "in use" : "NOT in use");
+}
+
+void setGlide(int mode) {
+    s_forceGlide = mode;
+    Serial.printf("[radar] glide -> %s\n",
+                  mode < 0 ? "auto (custom designs snap)" : (mode ? "forced on" : "forced off"));
+}
+
+void noteSelectionDetailArrived() {
+    if (s_selectMode) s_selActivityMs = lv_tick_get();
+}
+
+// The SAME sweep, on another tile. See the header for why this is not a second one.
+//
+// The scope is tile 0 of a tileview and the weather map is tile 1, so the sweep built here
+// simply is not on the weather tile: it had no sweep at all. Moving the object costs a
+// re-parent and nothing else, because the timer that turns it is created once in init() and
+// never paused, and it advances by real elapsed time rather than by ticks. It therefore
+// keeps turning at the same rate through the move, and arrives at the right angle rather
+// than starting again from zero.
+//
+// Ordering: foreground within its new parent, so it sits over the precipitation image the
+// way it sits over the scope's rings. Callers that put anything above it re-assert that
+// afterwards, the same as everywhere else on this device.
+// Build the weather map its OWN sweep, on its own tile, from its own settings.
+//
+// This started out as "move the scope's sweep across", which worked and was wrong: the
+// weather map then wore the Flight Tracker's brass, because it was literally the Flight
+// Tracker's object. They are separate apps that happen to be built the same way.
+//
+// What is shared is the timer and s_sweepDeg, which is the only part smoothness ever
+// depended on. Nothing else crosses between them: not the colour, not the artwork, not the
+// speed, not the on/off switch.
+void buildWeatherSweep(void *lv_parent) {
+    lv_obj_t *parent = (lv_obj_t *)lv_parent;
+    if (!parent || s_wxSweep) return;
+    s_wxSweep = make_layer(parent, wx_sweep_draw_cb);
+    lv_obj_move_foreground(s_wxSweep);
+}
+
+} // namespace radar

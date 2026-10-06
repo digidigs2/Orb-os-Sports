@@ -1,0 +1,78 @@
+name: Release firmware
+
+# Push a tag like v1.0.0 to build the merged firmware and attach it to a GitHub
+# Release (a single .bin makers can flash with esptool or the web flasher):
+#   git tag v1.0.0 && git push origin v1.0.0
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install PlatformIO + esptool
+        run: pip install platformio esptool
+
+      - name: Build firmware
+        run: pio run -e esp32-s3-amoled-175
+
+      - name: Merge into a single flashable binary
+        run: |
+          B=.pio/build/esp32-s3-amoled-175
+          BOOT_APP0="$(find "$HOME/.platformio/packages" -name boot_app0.bin -path '*framework-arduinoespressif32*' | head -1)"
+          python -m esptool --chip esp32s3 merge_bin -o TheOrbOS-esp32s3.bin \
+            --flash_mode dio --flash_freq 80m --flash_size 16MB \
+            0x0     "$B/bootloader.bin" \
+            0x8000  "$B/partitions.bin" \
+            0xe000  "$BOOT_APP0" \
+            0x10000 "$B/firmware.bin"
+
+      # WHAT CHANGED, in the words the person updating reads on the Flash button.
+      #
+      # This step is new because the body below REPLACES whatever tools/release-firmware.sh
+      # wrote, so the per-version notes never reached the release page and the page said only
+      # how to flash. wizard.oz, 2026-10-06: "could the release notes go into the description
+      # on the release in github for easier perusal at update time", and in the same breath
+      # that RELEASE_NOTES.md looked stuck at 2.16.38. It is not stale; it was never shown.
+      - name: Write the flashing half of the body
+        run: |
+          cat > RELEASE_BODY.md <<'EOF'
+          **First flash (USB):** `TheOrbOS-esp32s3.bin` — the full merged image (offset `0x0`).
+          - Browser, no toolchain: https://zionbrock.com/orb
+          - Or: `esptool.py --chip esp32s3 write_flash 0x0 TheOrbOS-esp32s3.bin`
+
+          **Updating an Orb you already have:** open Orb Studio and press Flash. It puts all
+          four files at the four offsets they belong at, which is the part that is easy to get
+          wrong by hand. There is no over-the-WiFi update: the device's OTA page is compiled
+          out, so do not go looking for `theorb.local/update`.
+          EOF
+        shell: bash
+
+      - name: Pull this version's section out of RELEASE_NOTES.md
+        run: |
+          V="${GITHUB_REF_NAME#v}"
+          awk -v v="## $V" '$0 == v {on=1; next} on && /^## / {exit} on && $0 != "---" {print}' \
+            RELEASE_NOTES.md > NOTES_SECTION.md
+          [ -s NOTES_SECTION.md ] || echo "(no notes recorded for this version)" > NOTES_SECTION.md
+          { echo "**What changed**"; echo; cat NOTES_SECTION.md; echo; cat RELEASE_BODY.md; } > BODY.md
+        shell: bash
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            TheOrbOS-esp32s3.bin
+          generate_release_notes: true
+          body_path: BODY.md

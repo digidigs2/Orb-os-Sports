@@ -1,0 +1,98 @@
+#pragma once
+#include <lvgl.h>
+
+// Per-theme typography: fonts that travel with a theme instead of being compiled in.
+//
+// Fonts were the last welded thing. Everything else a theme owns — artwork, colours,
+// positions, hand geometry, the app roster, display names — travels as data on the SD
+// card and reaches the device over WiFi. Fonts were real compiled LVGL glyph bitmaps
+// baked into the firmware binary, which had two consequences, both of which cost real
+// time this week:
+//
+//   1. Only ONE theme's fonts existed at a time, whichever was flashed last. Switching
+//      themes in Settings > Design gave you the new theme's artwork wearing the previous
+//      theme's typography, with nothing to explain it. That produced a genuine
+//      Modern-fonts-over-Steam-Punk hybrid on the bench.
+//   2. Every theme push had to rebuild and reflash the firmware over USB (~48 s and a
+//      cable), even when the only change was a background image, because Launch Kit had
+//      no way to know whether a font had moved.
+//
+// Launch Kit now emits each font as an lv_font_conv binary and ships it like any other
+// theme asset. The device stores it in the `themeart` flash partition (theme_art.h) and
+// loads it through an lv_fs driver that reads straight out of the memory map, so no card
+// access is involved at draw time.
+//
+// Everything degrades to the old behaviour: a theme that ships no font, a font that fails
+// to load, or a device with no themeart partition all fall back to the compiled
+// CUSTOM_*_FONT the firmware was built with. A missing font must never mean no text.
+namespace theme_font {
+
+// Register the lv_fs driver and load whatever fonts the active theme ships. Call once at
+// boot, after theme_art::begin() (it reads from the mapped partition) and before any view
+// asks for a font. Safe to call twice.
+void begin();
+
+// One accessor per text slot. Each returns the theme's font when it loaded, and the
+// compiled fallback otherwise, so callers never need a null check or a fallback of their
+// own — which is what keeps this from leaking into every renderer.
+const lv_font_t *clock_text1();
+const lv_font_t *clock_text2();
+const lv_font_t *menu_current();
+const lv_font_t *menu_prev();
+const lv_font_t *menu_next();
+const lv_font_t *settings_item();
+// The selected row, which a theme may set to a different WEIGHT from the rest. Weight is
+// baked into a converted face rather than something the device can vary, so a second
+// weight means a second file; a theme that wants one weight ships one and this returns the
+// same face as settings_item(). See THEME_CAPS 22.
+const lv_font_t *settings_sel();
+const lv_font_t *radar_text(int idx);      // idx 0..3, clamped
+const lv_font_t *radar_loc();              // the Flight Tracker's location line, THEME_CAPS 54
+
+// The Weather map's four, THEME_CAPS 28. Check weather_has_font() before honouring a size
+// control: a loaded face is baked at one size and ignores any size asked of it afterwards.
+const lv_font_t *weather_text(int idx);    // idx 0..3, clamped
+bool weather_has_font(int slot);           // 0..3
+// The Headlines screen's four text slots. Each returns nullptr-free: the theme's face when
+// one loaded, LV_FONT_DEFAULT otherwise. A caller that also has a SIZE to honour should
+// check `intel_has_font()` first — a loaded face is baked at one size and ignores any
+// slider, which is the same contract every other themed text slot on the device has.
+const lv_font_t *intel_title();
+const lv_font_t *intel_text();
+const lv_font_t *intel_source();
+const lv_font_t *intel_age();
+// The briefing's body, THEME_CAPS 49. Optional: a theme that gives the story no face of
+// its own ships no file, and intel_view then draws the body in the source credit's face,
+// which is what it always did.
+const lv_font_t *intel_brief();
+bool intel_has_font(int slot);   // 0 title, 1 text, 2 source, 3 age, 4 brief
+
+// The Stock Ticker's four. Same contract: check ticker_has_font() before honouring a size
+// slider, because a theme's face is baked at one size and cannot be scaled afterwards.
+const lv_font_t *ticker_name();
+const lv_font_t *ticker_price();
+const lv_font_t *ticker_change();
+const lv_font_t *ticker_strip();
+bool ticker_has_font(int slot);  // 0 name, 1 price, 2 change, 3 strip
+
+// Every font file a theme can ship, in slot order, for the bake. theme_art_bake used to
+// keep a list of its own with eleven names on it, written when there were eleven slots;
+// the fifteen added since (Headlines, Ticker, Weather, wind screen) were shipped by Studio,
+// declared by the theme, written to the card, and never baked, and this loader reads only
+// the bake. Every one of those screens drew the compiled face whatever the design said.
+// One list, owned here, is the fix.
+const char *const *slot_files(size_t &count);
+
+// How many of this theme's fonts actually loaded from flash. 0 means everything is
+// running on compiled fallbacks, which is the honest "nothing changed yet" state rather
+// than a failure.
+const lv_font_t *wind_title();
+const lv_font_t *wind_ask();
+const lv_font_t *wind_turns();
+bool wind_has_font(int slot);   // 0 title, 1 ask, 2 turns
+int loaded_count();
+// One slot's state, for the ?orb fonts report: whether this theme declares the file, and
+// whether it is the face actually drawing (loaded from the bake) or the compiled fallback.
+bool slot_loaded(size_t i);
+
+} // namespace theme_font
