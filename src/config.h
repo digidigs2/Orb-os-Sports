@@ -7,7 +7,7 @@
 // "1.4.2", said "up to date", and left an Orb missing everything in that list. THEME_CAPS
 // exists because this stopped moving; it covers theme settings and nothing else, so a new
 // command or a deleted screen is invisible to it. Move this too.
-#define FW_VERSION "2.16.65"   // shown on the web config page + Stats screen
+#define FW_VERSION "2.17.00"   // shown on the web config page + Stats screen
 // Edit pins below: replace every -1 with the value from the Waveshare factory demo
 // (see docs/HARDWARE.md and docs/SETUP.md). Do NOT guess them.
 
@@ -290,6 +290,20 @@ static const float RANGE_STEPS_KM[] = {10.0f, 20.0f, 30.0f, 50.0f, 100.0f};
 #define PIN_TP_RST          40
 #define TP_MIRROR_X         true
 #define TP_MIRROR_Y         true
+
+// CONFIRMED FROM THE SCHEMATIC — the panel's TEARING EFFECT output.
+//
+// Waveshare's schematic for this board (ESP32-S3-Touch-AMOLED-1.75.pdf) has
+// "GPIO13  LCD_TE", carried on pin 11 of the display FPC J301 through an 0R link, so the
+// signal is genuinely present and populated rather than a depopulated option. The firmware
+// had never used GPIO13 for anything.
+//
+// It matters because the CO5300's GRAM is rewritten by us while the panel independently
+// scans it out: without this, a write that lands mid-scan shows the top of the new frame
+// and the bottom of the old one at the same time, which on a radar sweep looks like a line
+// broken into offset halves. TE pulses at the start of vertical blanking and is what makes
+// "write between scans" possible at all. Set -1 to disable the wait (see display.cpp).
+#define PIN_LCD_TE          13
 
 // CONFIRMED — CO5300 QSPI databus (LCD_CS=12, LCD_RST=39 above match too):
 #define PIN_LCD_SCLK        38             // QSPI PCLK

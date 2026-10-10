@@ -41,6 +41,12 @@ static volatile uint32_t s_inputAtMs = 0;  // see display::markInput
 static volatile uint32_t s_inputPx0  = 0;  // pixels flushed when that input arrived
 static volatile uint32_t s_flushedPx = 0; // cumulative pixels pushed (dirty-area size)
 uint32_t display_flushed_px() { return s_flushedPx; }
+// What the PANEL is actually sent, which since the single-transaction flush is no longer the
+// same number as above: s_flushedPx counts the strips LVGL rendered, this counts the one box
+// per frame that reaches the glass. Keeping both is what makes "is the box bigger than the
+// dirty area" answerable, which is exactly the question the full-width band got wrong.
+static volatile uint32_t s_pushedPx = 0;
+uint32_t display_pushed_px() { return s_pushedPx; }
 static bool s_logQuiet = false;
 void orb_log_set_quiet(bool quiet) { s_logQuiet = quiet; }
 bool orb_log_quiet() { return s_logQuiet; }
@@ -139,6 +145,118 @@ static void flush_arbitrary(const lv_area_t *area) {
     }
 }
 
+// ---- tear-free single-transaction flush (rotation 0) -------------------------
+// WHY THIS EXISTS. LVGL renders a dirty region in LVGL_BUF_LINES-tall strips and the old
+// flush_cb pushed each strip to the panel the instant it was rendered. For the Flight
+// Tracker's sweep that is ~13 separate QSPI writes spread across the WHOLE frame, and the
+// frame is 54-88 ms measured. The panel is scanning its GRAM out the entire time, so for
+// those tens of milliseconds the glass holds a mixture of the new frame's upper strips and
+// the old frame's lower ones. A sweep hand crosses every strip, so it appears as a line
+// snapped into offset segments -- the fault Greg could see and which no amount of making
+// the frame CHEAPER was ever going to fix, because the tear window is the RENDER time, not
+// the transfer time (flush was only 67 of 640 ms per second).
+//
+// So: render every strip into a full-screen staging buffer, remember the rows touched, and
+// push them ONCE when LVGL says the frame is done. The tear window collapses from the whole
+// render to a single transfer.
+//
+// The staging buffer is free. s_frameBuf is a 434 KB full-screen framebuffer that was
+// already being allocated at boot and, at every cardinal rotation, never read or written --
+// both of its uses are gated on `arbitrary`. It was dead weight until now.
+//
+// THE TIGHT BOUNDING BOX, streamed with a stride. The first version of this pushed
+// full-width BANDS, because draw16bitRGBBitmap wants a tightly packed w*h block and the rows
+// of a sub-rectangle are not contiguous in a 466-wide framebuffer. That worked and it halved
+// the artifact, but it pushed about twice the pixels needed (466 wide against a ~240 px dirty
+// box) and measured 17.8 ms of transfer against a panel refresh period of roughly 16.7 ms --
+// so the write still RACED the scan-out instead of beating it, and the tear was reduced
+// rather than removed. Confirmed on the glass, not inferred.
+//
+// One address window, then one writePixels per row at the framebuffer's stride, is the way
+// out. The panel's GRAM pointer auto-increments inside a CASET/PASET window, so N strided row
+// writes inside ONE window are a single logical transfer and reintroduce no tearing between
+// rows -- this is the same thing Arduino_TFT::draw16bitRGBBitmap already does on its clipped
+// path, just with the stride we need. ~120 KB instead of ~233 KB, which fits inside one
+// refresh period rather than straddling it.
+//
+// 2-pixel alignment is still honoured: rounder_cb gives LVGL areas an even x1 and an odd x2,
+// and a union of such boxes keeps both, which is what the CO5300 requires of a window.
+//
+// Rotation 0 only. 90/180/270 and the arbitrary-angle path are untouched below: they each
+// transform the strip on its way past, which this staging path would have to redo, and
+// nobody is looking at a tear on a rotated Orb today. Said plainly rather than left to be
+// discovered: if those angles ever need it too, they need their own version of this.
+// TWO THINGS TRIED HERE AND REVERTED, recorded so they are not tried again:
+//
+// 1. Staging the pixels ALREADY BYTE-SWAPPED and pushing with writeBytes (which hands the
+//    caller's buffer straight to the DMA) instead of writePixels (which swaps each pixel into
+//    its own internal buffer first). Measured on 2026-10-06: 4.8 MB/s raw against 4.9 MB/s
+//    swapped. Identical. The per-pixel swap was never the bottleneck.
+//
+// 2. Packing the box into a contiguous buffer so it could go as ONE writeBytes instead of one
+//    strided writePixels per row -- 58 DMA chunks rather than 250 calls. Measured WORSE:
+//    16.7 ms against 13.3 ms for the same ~119 KB. The PSRAM-to-PSRAM pack copy costs more
+//    than the call overhead it saves, which also says the per-transaction overhead is small
+//    (~8 us), so there is nothing to win by enlarging ESP32QSPI_MAX_PIXELS_AT_ONCE either.
+//
+// What the numbers say instead: ~119 KB in 13.3 ms is 8.9 MB/s, i.e. about 84 Mbit/s, and the
+// bus is configured with SPICOMMON_BUSFLAG_GPIO_PINS -- the GPIO matrix rather than the SPI
+// IOMUX pins -- which holds SPI2 far below the 80 MHz LCD_QSPI_HZ asks for. The transfer is at
+// the bus floor and no amount of restructuring the push will move it.
+//
+// So the remaining lever on tearing is the SIZE OF THE BOX, not the speed of the write. A
+// smaller dirty area is a shorter transfer is a narrower tear window, which is the second
+// reason (after frame cost) to want sweepLength and sweepTrailSteps lower.
+static lv_coord_t s_boxX1 = 0, s_boxY1 = 0, s_boxX2 = -1, s_boxY2 = -1;   // x2 < x1 means none
+// Is the staged single-transaction flush live at all?
+//
+// A switch, because it is the one change in this file that touches EVERY screen, and "the clock
+// got slower after the flush rewrite" has to be answerable by measurement rather than by my
+// arithmetic about it. stage=0 restores the original behaviour exactly: render a strip, push
+// that strip, move on -- tearing and all.
+//
+// Note what it costs even when the timing looks small. At rotation 0 this path writes 434 KB
+// into s_frameBuf and reads it back out again for every FULL-SCREEN frame, and PSRAM bandwidth
+// is shared with everything else that frame is doing -- the clock composes into a PSRAM canvas
+// and rotates its hands out of PSRAM. Contention does not show up in s_flushUs; it shows up as
+// everything else getting slower, which is exactly the shape of the fault being chased.
+static bool       s_stageFlush = true;
+static bool       s_teOn   = false;              // panel is emitting TE and we wait for it
+static uint32_t   s_teWaitUs = 0;                // cumulative us spent waiting, for /health
+
+// Park the write in the panel's vertical blanking. TE rises as blanking starts, so sync to
+// that edge: drain any pulse already in progress, then wait for the next rise.
+//
+// Bounded, and the bound is the point. A TE that never arrives (wrong pin, panel not
+// emitting, 0R not fitted on some board revision) must cost one frame of latency and then
+// be ignored -- never hang the render loop, which on this device also means never starve the
+// knob or the watchdog.
+static inline void wait_for_te(void) {
+#if defined(PIN_LCD_TE) && (PIN_LCD_TE >= 0)
+    if (!s_teOn) return;
+    const uint32_t t0 = micros();
+    while (digitalRead(PIN_LCD_TE) == HIGH && (micros() - t0) < 25000) { }
+    while (digitalRead(PIN_LCD_TE) == LOW  && (micros() - t0) < 25000) { }
+    s_teWaitUs += micros() - t0;
+#endif
+}
+uint32_t display_te_wait_us() { return s_teWaitUs; }
+void display_set_stage(bool on) {
+    if (s_stageFlush == on) return;
+    s_stageFlush = on;
+    s_boxX1 = 0; s_boxY1 = 0; s_boxX2 = -1; s_boxY2 = -1;   // drop any part-built box
+    lv_obj_t *scr = lv_scr_act();
+    if (scr) lv_obj_invalidate(scr);
+    Serial.printf("[display] staged flush -> %s\n", on ? "on (one transaction per frame)"
+                                                        : "off (per-strip, the original path)");
+}
+bool display_stage(void) { return s_stageFlush; }
+void display_set_te(bool on) {
+    s_teOn = on;
+    Serial.printf("[display] TE sync -> %s\n", on ? "on" : "off");
+}
+bool display_te(void) { return s_teOn; }
+
 // LVGL -> panel, applying the chosen rotation while pushing.
 //   0°   : straight through.
 //   180° : reverse the flat block in place — no scratch buffer.
@@ -173,6 +291,44 @@ static void flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *px) 
     if (arbitrary && s_frameBuf && s_rotBuf) {
         flush_arbitrary(area);
         if (lv_disp_flush_is_last(drv)) s_frameCount++;
+        s_flushUs += micros() - t_flush0;
+        lv_disp_flush_ready(drv);
+        return;
+    }
+
+    // Rotation 0: stage into the framebuffer and push one box per frame (see above).
+    // With staging off, control falls through to the legacy per-strip path below, which already
+    // handles angle 0 as a straight-through push.
+    if (s_stageFlush && angle == 0 && s_frameBuf) {
+        for (int row = 0; row < h; ++row) {
+            memcpy(s_frameBuf + (size_t)(area->y1 + row) * SCREEN_W + area->x1,
+                   px + (size_t)row * w, (size_t)w * sizeof(lv_color_t));
+        }
+        if (s_boxX2 < s_boxX1) {
+            s_boxX1 = area->x1; s_boxY1 = area->y1; s_boxX2 = area->x2; s_boxY2 = area->y2;
+        } else {
+            if (area->x1 < s_boxX1) s_boxX1 = area->x1;
+            if (area->y1 < s_boxY1) s_boxY1 = area->y1;
+            if (area->x2 > s_boxX2) s_boxX2 = area->x2;
+            if (area->y2 > s_boxY2) s_boxY2 = area->y2;
+        }
+        if (lv_disp_flush_is_last(drv)) {
+            if (s_boxX2 >= s_boxX1 && s_boxY2 >= s_boxY1) {
+                const uint16_t bw = (uint16_t)(s_boxX2 - s_boxX1 + 1);
+                const uint16_t bh = (uint16_t)(s_boxY2 - s_boxY1 + 1);
+                s_pushedPx += (uint32_t)bw * bh;
+                wait_for_te();
+                s_gfx->startWrite();
+                s_gfx->writeAddrWindow((int16_t)s_boxX1, (int16_t)s_boxY1, bw, bh);
+                for (uint16_t r = 0; r < bh; ++r) {
+                    s_bus->writePixels((uint16_t *)(s_frameBuf + (size_t)(s_boxY1 + r) * SCREEN_W + s_boxX1),
+                                       bw);
+                }
+                s_gfx->endWrite();
+            }
+            s_boxX1 = 0; s_boxY1 = 0; s_boxX2 = -1; s_boxY2 = -1;
+            s_frameCount++;
+        }
         s_flushUs += micros() - t_flush0;
         lv_disp_flush_ready(drv);
         return;
@@ -278,6 +434,29 @@ bool begin() {
         return false;
     }
     dmark("after gfx begin");
+    // Turn the panel's tearing-effect output ON. Arduino_CO5300's init sequence has the
+    // TEARON line commented out, so the panel ships with it disabled and the GPIO the
+    // schematic routes it to reads nothing. 0x35 with 0x00 = pulse on vertical blanking
+    // only (0x01 would add horizontal, which is noise for a whole-band write).
+#if defined(PIN_LCD_TE) && (PIN_LCD_TE >= 0)
+    pinMode(PIN_LCD_TE, INPUT);
+    s_bus->beginWrite();
+    s_bus->writeC8D8(0x35, 0x00);   // CO5300_WC_TEARON
+    s_bus->endWrite();
+    // Proof the signal is actually moving, rather than an assumption that it is. A pin that
+    // never changes means the wait would burn its whole timeout every frame, so it is better
+    // to find that out here, once, than to pay for it silently forever.
+    {
+        const int first = digitalRead(PIN_LCD_TE);
+        bool moved = false;
+        const uint32_t t0 = micros();
+        while ((micros() - t0) < 50000) if (digitalRead(PIN_LCD_TE) != first) { moved = true; break; }
+        s_teOn = moved;
+        Serial.printf("[display] LCD_TE on GPIO%d: %s -> TE sync %s\n", PIN_LCD_TE,
+                      moved ? "toggling" : "STUCK (no pulse in 50 ms)",
+                      moved ? "on" : "off");
+    }
+#endif
     s_gfx->fillScreen(RGB565_BLACK);
     s_gfx->setBrightness(BRIGHTNESS_DEFAULT);
     Serial.println("[display] panel up; init LVGL...");

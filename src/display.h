@@ -45,6 +45,12 @@ uint32_t display_frames();   // total rendered frames (for FPS measurement)
 uint32_t display_lvgl_us();  // cumulative microseconds inside lv_timer_handler()
 uint32_t display_flush_us(); // cumulative microseconds pushing pixels to the panel
 uint32_t display_flushed_px(); // cumulative pixels flushed (how much screen is repainted)
+uint32_t display_pushed_px();  // cumulative pixels actually sent to the panel (one box per frame)
+uint32_t display_te_wait_us(); // cumulative microseconds spent waiting for the panel's TE pulse
+void     display_set_stage(bool on);  // staged one-transaction-per-frame flush vs the original per-strip push
+bool     display_stage(void);
+void     display_set_te(bool on);  // tear-free flush: wait for vertical blanking before pushing
+bool     display_te(void);         // is the TE wait active (panel emitting, pin toggling)?
 
 // Silence the per-event console chatter, for a screen where the chatter is a cost rather
 // than a diagnostic.

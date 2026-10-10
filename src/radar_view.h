@@ -119,6 +119,8 @@ void setGlide(int mode);
 void setSweepAA(int on);
 // How many lines the sweep's trail fan has, live; 0 restores the design's own count.
 void setTrailSteps(int n);
+void setBlipAA(int on);   // bilinear vs nearest-neighbour on the rotated aircraft icon
+void setPacePct(int pct); // frame-request margin over measured render cost, percent (150 = the old 1.5x)
 
 // Tell the scope whether the WiFi is up and how long since the last aircraft. It shows a
 // small banner naming the actual culprit once a gap is real (45 s), because a blank scope

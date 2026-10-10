@@ -3,6 +3,10 @@
 // A simple full-screen clock, living on its very own LVGL screen so it stays
 // completely independent of the radar UI. App two in the shell.
 namespace clockview {
+    // How many pixels the hand-layer cache draws differently from a full compose, and by
+    // how many 565 levels at worst. 0 is the only good answer; -2 means the layers were not
+    // in use, so the comparison proved nothing.
+    long layerDiffersBy(int *worstOut, int *wx, int *wy);
     void      init();      // build the clock screen; call once after display::begin()
     lv_obj_t* screen();    // the clock's LVGL screen (hand this to app_shell::add)
     // The art contract every screen on this device is supposed to keep, and this one did
@@ -35,6 +39,19 @@ namespace clockview {
     // then jumped a division. Exposed with the pixels its tip covers in that time, because
     // "a pixel" is the whole rule and a threshold in minutes alone cannot be checked.
     float     hourCacheMinutes();
+    // How a looping background and the drawing tick agree on a rate. Exposed because the
+    // fault it fixes is invisible in a still: every frame has to be held for the same number
+    // of ticks, or the picture judders however even its own geometry is.
+    uint32_t  bgTickPeriod(int fps, uint32_t base, uint32_t &every);
+    // And the same question for a TICKING dial, where a frame has to land on the second so
+    // the hand moves with its own click rather than after it.
+    uint32_t  aimPeriod(uint32_t aim, uint32_t need);
+    // How long until the next second. Exposed because getting it a fraction short put the
+    // hand a whole second behind its own click, and nothing on the glass says which.
+    uint32_t  aimToSecond(uint32_t usec);
+    // What one full face last cost, split by phase, in milliseconds. Reported on /health so
+    // a slow dial can be diagnosed from a browser instead of from a serial cable.
+    void      composeCost(float &face, float &plate, float &text, float &hands);
     float     hourTipPixelsIn(float minutes);
     // Where the minute hand belongs, in minutes-of-the-hour. Exposed for the self-test:
     // a railway dial has to land on a whole minute at every second of the minute.
@@ -64,6 +81,9 @@ namespace clockview {
     // on where the hands happen to be when the test runs, so a threshold on it passes at one
     // minute and fails at the next; the count does not move. The fault this guards against
     // was 9,916 pixels, and what is left is about twenty under the hand cap.
+    // Beats a second the sweeping hand is stepping at; x3600 for the beats-per-hour a
+    // watchmaker would quote (8 is 28,800, 4 is 14,400).
+    int       sweepBeat();
     long      sweepDiffersBy(int *x, int *y);
     float     railwayStopStart();
     // Which beat of the second a given instant falls in. Exposed so the self-test can hold the
@@ -72,7 +92,43 @@ namespace clockview {
     // How long the tick's own timer waits, from a given point in the second. Exposed because
     // the whole value of that timer is that it lands on the second and nothing else.
     uint32_t  beatAim(long usec);
+    // The SWEEP's beat arithmetic, for the self-test. Milliseconds from a wake's fire
+    // instant until the next one, given how far past a beat boundary the wake fired
+    // (intoUs), what it has spent so far (workedMs), and the beat it is stepping at.
+    // Three rules the 2.16.71 version broke, all checkable without a clock: the wake
+    // never lands before its work finished, never before a beat boundary, and never a
+    // whole beat later than the first boundary its work clears.
+    uint32_t  beatWait(long intoUs, long workedMs, int beat);
+    // Cadence accounting since boot, for /health: what the interval between drawn
+    // frames actually did, not what the timer intended. frameMs is the rolling cost
+    // of one, beat the latched rate it is stepping at.
+    struct Cadence {
+        uint32_t wakes, early, late, dup, skip;
+        uint32_t jitAvgMs, jitMaxMs;
+        int      beat;
+        float    frameMs;
+    };
+    void      cadence(Cadence &out);
     // Whether a design whose full compose costs this many milliseconds can afford to animate
     // the minute hand's step, rather than clicking it over in one move.
     bool      stepAffordable(float composeMs);
+    // The hand-layer cache's rebuild cadence, for the self-test. A dial that draws one
+    // frame a second must spend NOTHING on a stale layer's rebuild in the frame that
+    // notices: the ~470 ms of band work belongs in the dead centre of the second, chewed
+    // through by a helper timer between ticks, while the previous in-tolerance picture
+    // keeps the glass filled. Slicing it across eight of those once-a-second frames put
+    // the minute hand on the glass in two visible phases forever (Aviator at 1 bps,
+    // 2026-10-08); running it whole inside the boundary frame hiccupped the second hand
+    // half a second behind its own click five minutes later. A fast caller — the sweep,
+    // an animated background — still drives its rebuild's bands inline, one per frame.
+    //
+    // layersTick takes one frame of the upkeep with the spread decided FOR the caller (the
+    // real callers ask layers_spreadable()); layersRebuilding says whether a sliced rebuild
+    // is in flight; layersForceStale ages the cache the way the creeping minute hand
+    // would; layersPump advances an in-flight rebuild by the band the helper timer would
+    // take, without the test waiting on a timer.
+    bool      layersTick(float minAng, float hrAng, bool spread);
+    bool      layersRebuilding();
+    void      layersForceStale();
+    void      layersPump();
 }

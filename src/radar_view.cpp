@@ -164,8 +164,21 @@ static uint32_t s_acInterpMs = 0;
 // -1 auto (custom designs snap, built-ins glide), 0 force snap, 1 force glide. Never
 // persisted: an instrument, not a setting.
 static int s_forceGlide = -1;
+// Frame-request margin over the measured render cost, in percent. 150 was the original hard
+// 1.5x; 100 asks for frames exactly as fast as they can be drawn. An instrument, never
+// persisted -- see the pacer in sweep_timer_cb for why the margin is now thought obsolete.
+static int s_pacePct = 150;
 // 0 = the design's own count. An instrument, never persisted.
 static int s_forceTrailSteps = 0;
+// Bilinear filtering on the rotated aircraft icon. LVGL's software transform has a separate
+// nearest-neighbour path (argb_no_aa in lv_draw_sw_transform.c) that is markedly cheaper, and
+// the aircraft layer measures as the dearest thing on the scope after the sweep's fan -- 23 ms
+// of a 72 ms frame on Aviator for six 57x51 icons.
+//
+// An instrument rather than a setting, and switchable live, because whether nearest-neighbour
+// looks acceptable on a small rotating sprite is a judgement for eyes on the glass, not a
+// number. Nothing persists it; 1 is the look the themes were designed against.
+static int s_blipAA = 1;
 // Set when the style changes under a running screen, so the pacing is measured fresh.
 static bool s_pacingStale = true;
 #define TRAIL_MAX         7
@@ -222,11 +235,14 @@ static float       s_sweepDeg = 0.0f;
 // one speed and it belonged to the Flight Tracker. Sharing the TIMER is what keeps the
 // motion even; sharing the ANGLE was never the part that mattered.
 static float       s_wxSweepDeg = 0.0f;
-// Sweep pacing state, at file scope so the loading gate can reset it. A multi-second
-// stall during first-entry projection would otherwise poison the smoothed frame time and
-// make the sweep lurch on its first few steps after the wait.
+// Sweep pacing state, at file scope so the loading gate can reset it. Zero means "no
+// previous frame", so the next step is measured from then rather than across a multi-second
+// projection stall, which would otherwise teleport the hand on first entry.
+//
+// There was a second variable here, an EMA of the frame time, and the angle was advanced by
+// it instead of by the real gap. See sweep_timer_cb for why that was the judder itself and
+// why nothing in a theme could reach it.
 static uint32_t    s_lastSweepMs = 0;
-static float       s_emaDtMs     = 0.0f;
 static float       s_prevSweepDeg = 0.0f;
 static float       s_wxPrevSweepDeg = 0.0f;
 static float       s_wavePhase = 0.0f;
@@ -691,7 +707,10 @@ static void wx_sweep_draw_cb(lv_event_t *e) {
     lv_draw_line_dsc_init(&ld);
     ld.color = lv_color_hex(ws.sweepColor);
     ld.width = (lv_coord_t)(ws.sweepTrailWidth < 1 ? 1 : ws.sweepTrailWidth);
-    ld.round_start = 1; ld.round_end = 1;
+    // No round caps, for the same reason as the Flight Tracker's fan: lv_draw_line draws each
+    // cap as its own lv_draw_rect with a radius mask, and here every line starts at the same
+    // centre and ends on the rim, so all of them are invisible.
+    ld.round_start = 0; ld.round_end = 0;
     for (int i = steps; i >= 1; --i) {
         const float frac = 1.0f - (float)i / (float)steps;
         const float ang  = s_wxSweepDeg - (float)i * (trailDeg / (float)steps);
@@ -705,7 +724,7 @@ static void wx_sweep_draw_cb(lv_event_t *e) {
     le.color = lv_color_hex(ws.sweepLeadColor);
     le.width = (lv_coord_t)(ws.sweepLeadWidth < 1 ? 1 : ws.sweepLeadWidth);
     le.opa = 217;
-    le.round_start = 1; le.round_end = 1;
+    le.round_start = 0; le.round_end = 0;
     lv_point_t lead = rim_point(s_wxSweepDeg, R);
     lv_draw_line(dctx, &le, &center, &lead);
 }
@@ -739,8 +758,18 @@ static void sweep_draw_cb(lv_event_t *e) {
     lv_draw_line_dsc_init(&ld);
     ld.color = trailColor;
     ld.width = customStyled() ? (lv_coord_t)theme_style::radar().sweepTrailWidth : 5;
-    ld.round_start = 1;
-    ld.round_end = 1;
+    // No round caps on the TRAIL lines, and this is a measurement rather than a taste.
+    //
+    // lv_draw_line implements each cap as a separate lv_draw_rect with LV_RADIUS_CIRCLE
+    // (lv_draw_sw_line.c), so a 20-step fan asks for 40 extra rounded-rect draws per frame,
+    // each with its own radius-mask setup. Every one of them is invisible here: all 20 lines
+    // START at the same centre point, where they overlap each other and sit under the hub, and
+    // they END on the rim where the cap is a 2 px bulge on a 5 px line nobody can resolve.
+    //
+    // Worth ~1-2 ms of a frame rather than the whole problem (see sweepTrailSteps for where
+    // the real cost is), but it is free and it is 40 draw calls.
+    ld.round_start = 0;
+    ld.round_end = 0;
     for (int i = steps; i >= 1; --i) {
         const float frac = 1.0f - (float)i / (float)steps;
         const float ang  = s_sweepDeg - (float)i * (trailDeg / (float)steps);
@@ -870,14 +899,29 @@ static inline int blip_reach(const theme_style::Radar &rs) {
 
 // glyph + label bounding box (for partial invalidation during the glide).
 // Must cover the label areas drawn in the aircraft layer (they grew for large-text mode).
-static inline lv_area_t glyph_bbox(lv_point_t p) {
+// `selected` means THIS contact is the one wearing the selection ring. It is a parameter
+// rather than a lookup because the ring is the single most expensive thing in this box and
+// it is drawn on AT MOST ONE aircraft: draw_custom_ac gates it on
+// `rs.selEnabled && s_selHex == ac.hex`.
+//
+// Every contact used to be padded as though it might be wearing it. On the F1 face that is
+// selDiameter/2 + selGlow = 32 px added to all four sides of all five boxes, for a ring the
+// theme has switched OFF — and the pad is a RADIUS, so it grows the area quadratically:
+// 185x185 = 34,225 px per contact where 121x121 = 14,641 would do, a 2.3x overdraw on a
+// layer measured at 26 ms of a 79 ms frame.
+//
+// Measured 2026-10-06 with /rdbg layer probes: the aircraft layer was the second biggest
+// cost on the scope after the sweep's fan, for five blips of 31x81 px.
+static inline lv_area_t glyph_bbox(lv_point_t p, bool selected) {
     lv_area_t a;
     if (customStyled()) {
         // No floating call/alt labels in custom style (those are the separate
-        // selection-banner system) — just cover the blip + its glow + the
-        // selection ring + its glow, generously, so the glide never trails ghosts.
+        // selection-banner system) — just cover the blip + its glow and, only where it is
+        // actually drawn, the selection ring + its glow, generously, so the glide never
+        // trails ghosts.
         const theme_style::Radar &rs = theme_style::radar();
-        const int pad = 16 + blip_reach(rs) + rs.blipGlow + rs.selDiameter / 2 + rs.selGlow;
+        const int selPad = (selected && rs.selEnabled) ? (rs.selDiameter / 2 + rs.selGlow) : 0;
+        const int pad = 16 + blip_reach(rs) + rs.blipGlow + selPad;
         a.x1 = p.x - pad; a.y1 = p.y - pad; a.x2 = p.x + pad; a.y2 = p.y + pad;
     } else if (orb()) { a.x1 = p.x - 30; a.y1 = p.y - 30; a.x2 = p.x + 30;  a.y2 = p.y + 30; }
     else          { a.x1 = p.x - 22; a.y1 = p.y - 22; a.x2 = p.x + 174; a.y2 = p.y + 32; }
@@ -925,8 +969,11 @@ static void interp_step(void) {
         pixels += labs((long)nx - ac.pos.x) + labs((long)ny - ac.pos.y);
         lv_point_t np; np.x = nx; np.y = ny;
         if (!seen) { ac.pos = np; continue; }
-        lv_area_t inv = glyph_bbox(ac.pos);
-        area_union(inv, glyph_bbox(np));
+        // Both ends of the step get the same selection answer, so a selected contact's ring
+        // is covered at the position it left as well as the one it reached.
+        const bool sel = !s_selHex.empty() && s_selHex == ac.hex;
+        lv_area_t inv = glyph_bbox(ac.pos, sel);
+        area_union(inv, glyph_bbox(np, sel));
         ac.pos = np;
         lv_obj_invalidate_area(s_acLayer, &inv);
     }
@@ -988,7 +1035,7 @@ static void sweep_timer_cb(lv_timer_t *t) {
     // first step after the wait is measured from the first real frame, not from the
     // seconds-long projection stall that preceded it.
     if (s_loadingPending) {
-        s_lastSweepMs = 0; s_emaDtMs = 0.0f;
+        s_lastSweepMs = 0;
         // Repaint only when the displayed second actually changes: this timer fires every
         // SWEEP_FRAME_MS (100 ms), and re-laying-out a label ten times a second for a number
         // that only moves once a second would just be a different way to burn the frame
@@ -1083,8 +1130,21 @@ static void sweep_timer_cb(lv_timer_t *t) {
     // frames is time spent rendering per screen frame, which does not depend on how often
     // the sweep asks — each frame draws it once either way.
     //
-    // Half as much again as the work, so the timer rather than the renderer decides when
-    // frames happen, which is this file's own rule about even arrival.
+    // The margin over the measured work. It was a hard 1.5x, and the reason it existed is GONE:
+    // "the timer rather than the renderer decides when frames happen" mattered only while the
+    // angle advanced by a SMOOTHED frame time, because then a late frame became a wrong-sized
+    // angular step. The angle now advances by the real elapsed gap (see above), so uneven
+    // arrival cannot produce uneven motion and the insurance is no longer buying anything.
+    //
+    // What it still costs is plain: at 1.5x the sweep asks for a frame every 1.5 render times,
+    // so the SWEEP TIMER, not the renderer, sets the frame rate -- measured 2026-10-06 on
+    // Aviator at 112 ms/frame, which is a 168 ms period and exactly the 6 fps observed. Nothing
+    // else on that screen requests frames, so this multiplier IS the ceiling. Proven by the
+    // loop-delay sweep: 5 ms down to 1 ms moved loop passes from 53 to 128 per second and left
+    // fps at 6, untouched, because frames were never what the loop was short of.
+    //
+    // Tunable rather than simply set to 100, because the floor below is also in play and the
+    // honest value is whatever measures best on a running Orb.
     //
     // Device only: display.cpp is not built for the simulator, where these counters do not
     // exist and a desktop's frame time would say nothing about an ESP32's anyway.
@@ -1105,7 +1165,7 @@ static void sweep_timer_cb(lv_timer_t *t) {
         }
         lastUs = us; lastFrames = fr;
         if (ema > 0.0f) {
-            uint32_t want = (uint32_t)(ema * 1.5f + 0.5f);
+            uint32_t want = (uint32_t)(ema * (float)s_pacePct / 100.0f + 0.5f);
             // 40 ms is the floor on purpose. A sweep is a slow hand; past 25 a second the
             // extra frames buy nothing an eye can see and cost the whole screen.
             if (want < 40) want = 40;
@@ -1117,17 +1177,40 @@ static void sweep_timer_cb(lv_timer_t *t) {
         }
     }
 #endif
-    if (s_emaDtMs <= 0.0f) s_emaDtMs = (float)dtMs;
-    s_emaDtMs += 0.08f * ((float)dtMs - s_emaDtMs);
-    if (s_emaDtMs < 20.0f) s_emaDtMs = 20.0f;
-    if (s_emaDtMs > 400.0f) s_emaDtMs = 400.0f;
-    s_sweepDeg += speedDps * s_emaDtMs / 1000.0f;
+    // Advance by the RAW elapsed time. This was an EMA of it, and the EMA WAS the stutter
+    // rather than the cure for it.
+    //
+    // The reasoning it was built on — "what the eye catches is not a low frame rate, it is
+    // uneven steps" — conflates a step in SPACE with a velocity in TIME. Frames here do not
+    // arrive evenly and cannot be made to: a refresh costs 75-135 ms on this panel and that
+    // spread is the compositing, not the cadence. Given uneven arrival there are exactly two
+    // choices, and they are not symmetric:
+    //
+    //   raw dt       step_n = w * dt_n, so the angle displayed at time t is always w*t.
+    //                Apparent velocity is EXACTLY w on every frame. The steps differ in
+    //                size, but each one is on the glass for precisely as long as it is big,
+    //                and that is what smooth motion IS.
+    //
+    //   smoothed dt  step_n = w * mean(dt), a constant, displayed for dt_n. Apparent
+    //                velocity is w * mean(dt)/dt_n. The spread this file measured itself
+    //                (~103 ms avg, 55-60 ms spread, so roughly 75-135) swings that by 1.8x
+    //                several times a second. Equal steps at unequal intervals is the
+    //                definition of judder, not the absence of it.
+    //
+    // Which is also why slowing a sweep down never helped: scaling w scales both halves of
+    // that ratio and leaves the 1.8x swing exactly where it was. The F1 face made it obvious
+    // because its frame is dearer and so its spread is wider, but every theme had this in
+    // proportion to its own spread, and no theme value could reach it.
+    //
+    // Drift needs no anchor here: a scope hand has no absolute phase to keep, only a rate.
+    const float stepMs = (float)dtMs;
+    s_sweepDeg += speedDps * stepMs / 1000.0f;
     {
-        // The same smoothed dt, so it cannot judder independently of the other one.
+        // The same raw dt, so the two hands cannot judder independently of each other.
         const theme_style::Weather &ws = theme_style::weather();
         const float wxDps = (float)(ws.sweepSpeed < 1 ? 1 : (ws.sweepSpeed > 360 ? 360 : ws.sweepSpeed));
         s_wxPrevSweepDeg = s_wxSweepDeg;
-        s_wxSweepDeg += wxDps * s_emaDtMs / 1000.0f;
+        s_wxSweepDeg += wxDps * stepMs / 1000.0f;
         if (s_wxSweepDeg >= 360.0f) s_wxSweepDeg -= 360.0f;
     }
     if (s_sweepDeg >= 360.0f) s_sweepDeg -= 360.0f;
@@ -1391,7 +1474,7 @@ static void draw_custom_ac(lv_draw_ctx_t *d) {
                 idsc.pivot.x = bpx;
                 idsc.pivot.y = bpy;
                 idsc.opa = scale_opa(LV_OPA_COVER, ac.freshness);
-                idsc.antialias = 1;
+                idsc.antialias = (uint8_t)(s_blipAA ? 1 : 0);
                 // Selection style 2 (Recolor) forces the tint on for this one
                 // aircraft even if the design normally leaves the icon
                 // untinted — blipColor is already overridden to selColor
@@ -3219,7 +3302,6 @@ void setSweepFrameMs(uint32_t ms) {
     // Reseed the pacing state so the first step after a change is measured from now rather
     // than from a gap that belongs to the old period.
     s_lastSweepMs = 0;
-    s_emaDtMs = 0.0f;
     Serial.printf("[sweep] frame period -> %lu ms\n", (unsigned long)use);
 }
 
@@ -3241,6 +3323,18 @@ void setTrailSteps(int n) {
     s_forceTrailSteps = n;
     Serial.printf("[radar] trail lines -> %s%d\n", n > 0 ? "" : "the design's own, currently ", 
                   n > 0 ? n : theme_style::radar().sweepTrailSteps);
+}
+
+void setPacePct(int pct) {
+    s_pacePct = pct < 50 ? 50 : (pct > 300 ? 300 : pct);
+    s_pacingStale = true;   // forget the old measurement so the new margin applies from now
+    Serial.printf("[sweep] frame-request margin -> %d%% of render cost\n", s_pacePct);
+}
+
+void setBlipAA(int on) {
+    s_blipAA = on ? 1 : 0;
+    if (s_acLayer) lv_obj_invalidate(s_acLayer);
+    Serial.printf("[radar] blip antialias -> %s\n", s_blipAA ? "on (bilinear)" : "off (nearest)");
 }
 
 void setSweepAA(int on) {
