@@ -18,6 +18,16 @@ Rules for a section, all of them learned from what reads badly on that card:
 
 ---
 
+## 2.17.01
+
+- The hands are stacked the way the design asks again. The second hand was being pinned
+  underneath the others whatever the arrows on the hands card said, and on a dial where it
+  is shorter than the minute hand that left pieces of the old hands on the glass, cleared
+  only as the sweep passed over them. Worst in the first minute after a theme change. Found
+  and filmed by johnplayerspecial, traced to the cached hand layers and fixed by Lerxtwood
+
+---
+
 ## 2.17.00
 
 - The Orb stops running out of memory. This is what sits behind the theme sends that stop

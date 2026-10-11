@@ -88,12 +88,32 @@ BOOT0=$(find "$HOME/.platformio/packages" -name boot_app0.bin 2>/dev/null | head
 # not bumped. An update nobody can read about is one people put off, and the moment this is
 # optional is the moment it is skipped on the release that most needed it.
 # Each "- " bullet becomes one line, with wrapped continuations folded back onto it.
-NOTES=$(awk -v v="## $VERSION" '
-  $0 == v { on = 1; next }
-  on && /^## / { exit }
+#
+# A BETA READS AS A DIFFERENCE, NOT AS ONE VERSION'S CHANGELOG. The panel it feeds sits
+# under the public Flash button and answers one question: what is in this that is not in
+# what everybody else has. So on --beta the notes run from the version being published down
+# to the published public version's section, which is every version in between rather than
+# only the newest. Three fixes in an afternoon are three betas, and the third one saying
+# only what the third one changed is how the first two become invisible. Zion asked for this
+# on 2026-10-10: "a note with it telling what's changed since the public release."
+STOP_AT=""
+if [ "$BETA" = "1" ]; then
+  STOP_AT=$(grep -o '"version"[^,]*' "$PUBLIC/manifest.json" 2>/dev/null | grep -o '[0-9][0-9.]*' || echo "")
+fi
+NOTES=$(awk -v v="## $VERSION" -v stop="$STOP_AT" '
+  # Without a stop version this is the old behaviour exactly: one section, the one being
+  # published. With one, start at the version being published and keep going until the
+  # public version is reached.
+  stop == "" && $0 == v { on = 1; next }
+  stop == "" && on && /^## / { exit }
+  stop != "" && $0 == "## " stop { exit }
+  stop != "" && $0 == v { on = 1; next }
   !on { next }
   /^- / { if (line != "") print line; sub(/^- /, ""); line = $0; next }
-  /^[[:space:]]+[^[:space:]]/ && line != "" { sub(/^[[:space:]]+/, ""); line = line " " $0; next }
+  # Both ends trimmed before joining. A source line that ends in a space and a continuation
+  # that is then prefixed with another one is how "previously  composited" reached the card.
+  /^[[:space:]]+[^[:space:]]/ && line != "" { sub(/^[[:space:]]+/, ""); sub(/[[:space:]]+$/, "", line); line = line " " $0; next }
+  /^## / { if (line != "") { print line; line = "" } next }
   END { if (line != "") print line }
 ' RELEASE_NOTES.md)
 if [ -z "$NOTES" ]; then
