@@ -30,6 +30,9 @@
 #include "clock_view.h"
 #include "theme_audio.h"
 #include "intel_view.h"
+#include "scores_view.h"
+#include "score_store.h"
+#include "logo_store.h"
 #include "ticker_view.h"
 #include "ticker.h"
 #include "app_shell.h"
@@ -684,6 +687,11 @@ static void sim_register_apps(lv_obj_t *radarScreen) {
     // After the Ticker, matching main.cpp. The selftests below address apps by index, so the
     // two lineups have to stay in the same order or the simulator stops standing in for the
     // device at exactly the moment someone is using it to check one.
+    // Scores (Orbos-Sports), before Settings to match app_shell::Slot and main.cpp
+    score_store::begin();
+    app_shell::addLazy("Scores", scoresview::build, scoresview::destroy,
+                       scoresview::onPress, nullptr, false,
+                       scoresview::onEnter, scoresview::onExit, false);
     app_shell::add(settingsview::screen(), theme_style::names().settings,
                    settingsview::onPress, settingsview::onTurn, true, settingsview::onEnter, settingsview::onExit, false);
     app_shell::verifySlots(settingsview::screen());   // same check the device runs, same reason
@@ -1835,10 +1843,13 @@ int main(int argc, char **argv) {
             if (now - lastNet > 400) {
                 lastNet = now;
                 if (intelview::fetchStep()) intelview::onHeadlinesReady();
+                score_store::fetchStep();
+                logo_store::fetchStep();
             }
         }
         lv_tick_inc(now - last);
         last = now;
+        scoresview::tick();
         if (interactive) {                       // drive the app shell through the SAME path as the device
             simknob::tick(now);
             if (knob::takeLongPress()) sim_restart();   // real 8s hold -> same as the RESTART button

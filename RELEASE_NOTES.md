@@ -18,6 +18,16 @@ Rules for a section, all of them learned from what reads badly on that card:
 
 ---
 
+## 2.17.01-sports1
+
+- A Scores screen: your teams' live score, period and clock, today's game or the last
+  result, with team logos, and a second page with each team's next six games
+- NFL, NHL, NBA, MLB, WNBA and MLS, plus college football, basketball and baseball
+- Pick your teams at theorb.local/teams: pro teams from a list, college teams by pasting
+  their espn.com address
+
+---
+
 ## 2.17.01
 
 - The hands are stacked the way the design asks again. The second hand was being pinned

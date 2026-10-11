@@ -1,5 +1,20 @@
 # The Orb OS
 
+> **Orbos-Sports** is a fork of Zion Brock's Orb firmware
+> ([Ziplock78/orb-firmware](https://github.com/Ziplock78/orb-firmware)), version 2.17.01, with one
+> addition: a **Scores** screen for the sports teams you follow (NFL, NHL, NBA, MLB, WNBA, MLS and
+> college). Everything else is Zion's firmware, unchanged. See **[docs/SPORTS.md](docs/SPORTS.md)**
+> for the Scores screen and how to pick your teams.
+>
+> **Installing:** build and flash with PlatformIO from this folder:
+> `pio run -e esp32-s3-amoled-175 -t upload` (first build downloads the tools, 5–15 minutes).
+> Orb Studio's *firmware update* button would replace this build with Zion's official one;
+> themes from Orb Studio work as normal.
+>
+> The Orb, Orb Studio and The Orb OS are Zion Brock's work; this fork only adds the Scores
+> screen. Licensed MIT like the original: see [LICENSE](LICENSE) and [NOTICE](NOTICE).
+
+
 <p align="center">
   <a href="https://zionbrock.com/orb"><img src="https://img.shields.io/badge/The%20Orb-zionbrock.com%2Forb-B5713E" alt="The Orb"></a>
   <img src="https://img.shields.io/badge/board-ESP32--S3%20round%20AMOLED-E7352C?logo=espressif&logoColor=white" alt="Board: ESP32-S3 round AMOLED">

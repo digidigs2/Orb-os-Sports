@@ -5,6 +5,7 @@
 #include <esp_heap_caps.h>
 #include "sdcard.h"
 #else
+#include <sys/stat.h>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -57,6 +58,21 @@ uint8_t *read_whole(const char *path, size_t &outLen, size_t maxBytes) {
     return buf;
 }
 void free(uint8_t *buf) { if (buf) heap_caps_free(buf); }
+bool write_whole(const char *path, const uint8_t *data, size_t len) {
+    if (!sdcard::mounted()) return false;
+    Held held;
+    File f = SD.open(path, "w");
+    if (!f) return false;
+    const size_t put = f.write(data, len);
+    f.close();
+    return put == len;
+}
+
+bool make_dir(const char *path) {
+    if (!sdcard::mounted()) return false;
+    Held held;
+    return SD.exists(path) || SD.mkdir(path);
+}
 #else
 namespace {
 constexpr const char *SIM_SD_ROOT = "sim/sdcard";   // same stand-in root as roads_sd
@@ -79,6 +95,21 @@ uint8_t *read_whole(const char *path, size_t &outLen, size_t maxBytes) {
     return buf;
 }
 void free(uint8_t *buf) { if (buf) ::free(buf); }
+bool write_whole(const char *path, const uint8_t *data, size_t len) {
+    const std::string full = std::string(SIM_SD_ROOT) + path;
+    FILE *f = fopen(full.c_str(), "wb");
+    if (!f) return false;
+    const size_t put = fwrite(data, 1, len, f);
+    fclose(f);
+    return put == len;
+}
+
+bool make_dir(const char *path) {
+    const std::string full = std::string(SIM_SD_ROOT) + path;
+    ::mkdir(full.c_str(), 0755);
+    struct stat st;
+    return ::stat(full.c_str(), &st) == 0;
+}
 #endif
 
 } // namespace theme_sd

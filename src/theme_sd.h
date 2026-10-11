@@ -24,6 +24,10 @@ namespace theme_sd {
 // never the decoded pixels.
 uint8_t *read_whole(const char *path, size_t &outLen, size_t maxBytes);
 void free(uint8_t *buf);
+// Replace a small file in one go (a cache, not artwork). Takes the same lock as read_whole.
+bool write_whole(const char *path, const uint8_t *data, size_t len);
+// Create one directory level if it is missing (e.g. "/logos"). true if it exists afterwards.
+bool make_dir(const char *path);
 
 // The card is not thread safe and, until the chime started streaming, never needed to be:
 // every reader on this device ran on the main task, which made SD single-threaded by

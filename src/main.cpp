@@ -58,6 +58,10 @@
 #include "custom_apps.h"              // CUSTOM_APP_* — which apps a theme flash includes in the menu
 #include "spycam_view.h"             // Spy Cam: looping "security camera" flip-book
 #include "intel_view.h"
+#include "scores_view.h"         // Scores (Orbos-Sports)
+#include "score_store.h"
+#include "logo_store.h"
+#include "theme_sd.h"           // /teams.txt from the /teams page
 #include "ticker_view.h"
 #include "ticker.h"              // world headlines, read through the gateway
 #include <set>                       // audio: track which contacts are in range
@@ -564,6 +568,9 @@ static void adsb_task(void*) {
             // a kilobyte, so there is nothing to spread over several cycles. fetchStep() owns its own timing and returns immediately when
             // nothing is due, which is almost every pass through this loop.
             if (intelview::fetchStep()) g_intelDirty = true;
+            // Scores and team logos: each paces itself and returns at once when nothing is due.
+            score_store::fetchStep();
+            logo_store::fetchStep();
             // Quotes, through the same gateway and for the same reason. Well under a
             // kilobyte for a whole watchlist, so like the headlines there is nothing here
             // worth spreading over several passes; the step owns its own timing and returns
@@ -1719,10 +1726,159 @@ static const char ROOT_HEAD[] PROGMEM =
     "<h1>The Orb</h1><p class=sub>This Orb, over your WiFi</p>"
     "<div class=card><dl>";
 
+// The Scores screen's teams, picked by name. The Orb fetches each league's team list from
+// ESPN when the page asks (/teamlist), so the browser only ever talks to the Orb.
+static const char TEAMS_PAGE[] PROGMEM = R"HTML(<!doctype html><meta name=viewport content="width=device-width,initial-scale=1">
+<title>Orb teams</title><style>
+*{box-sizing:border-box}
+body{font:16px system-ui;margin:0;padding:22px 18px 60px;background:#101418;color:#e8edf2;max-width:640px;margin:auto}
+h1{font-size:20px;margin:0 0 4px}p{color:#98a2ad;margin:4px 0 14px;line-height:1.5}
+a{color:#8fc3ff}
+.bar{display:flex;flex-wrap:wrap;gap:8px;margin:10px 0 14px;align-items:center}
+.btn,select,input{padding:9px 12px;border-radius:10px;background:#22303a;color:#e8edf2;border:1px solid #33414c;font:inherit}
+.btn{cursor:pointer}.btn.go{background:#2c5a2a;border-color:#3c7a38}
+.btn:disabled{opacity:.45;cursor:default}
+select{max-width:100%}
+.row{display:flex;align-items:center;gap:10px;padding:8px 12px;border:1px solid #29323b;border-radius:10px;margin-bottom:6px;background:#161c22}
+.row img{width:32px;height:32px;object-fit:contain}
+.nm{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.lg{font-size:12px;color:#7d8893;margin-left:6px}
+.mv{background:none;border:0;color:#cfd8e0;cursor:pointer;font-size:18px;padding:2px 6px}
+.x{background:none;border:0;color:#ff8a6a;cursor:pointer;font-size:16px;padding:2px 6px}
+#prev{width:40px;height:40px;object-fit:contain;display:none}
+#msg{margin-top:12px;font:14px ui-monospace,monospace;white-space:pre-wrap;color:#98a2ad}
+.ok{color:#7ddb8a}.bad{color:#ff8a6a}
+details{margin-top:18px;color:#98a2ad}
+</style>
+<h1>Teams on the Scores screen</h1>
+<p>Pick up to six teams. They show on the Orb in this order. Save, and the Orb fetches their
+games straight away. <a href="/">Back</a></p>
+<div id=list></div>
+<div class=bar>
+ <select id=lg>
+  <option value="">League...</option>
+  <option value="nfl">NFL</option><option value="nhl">NHL</option><option value="nba">NBA</option>
+  <option value="mlb">MLB</option><option value="wnba">WNBA</option><option value="mls">MLS</option>
+ </select>
+ <select id=tm disabled><option>Team...</option></select>
+ <img id=prev alt="">
+ <button class=btn id=add disabled>Add</button>
+</div>
+<div class=bar><button class="btn go" id=save>Save</button></div>
+<div id=msg></div>
+<h1 style="font-size:16px;margin-top:20px">College teams, or any team by its address</h1>
+<p>Open the team on espn.com and paste its address here, for example
+<code>https://www.espn.com/college-football/team/_/id/151/east-carolina-pirates</code>.
+College football, men's and women's basketball and baseball all work, and so does any pro
+team's address.</p>
+<div class=bar><input id=murl style="flex:1;min-width:0" placeholder="https://www.espn.com/.../team/_/..."><button class=btn id=madd>Add</button></div>
+<script>
+const PATH={nfl:'football/nfl',nhl:'hockey/nhl',nba:'basketball/nba',mlb:'baseball/mlb',wnba:'basketball/wnba',mls:'soccer/usa.1'};
+const MAX=6;
+let teams=[], cache={};
+const $=id=>document.getElementById(id);
+function say(t,c){$('msg').innerHTML='<span class="'+(c||'')+'">'+t+'</span>';}
+const COLLEGE=l=>l.startsWith('ncaa');
+const LNAME={nfl:'NFL',nhl:'NHL',nba:'NBA',mlb:'MLB',wnba:'WNBA',mls:'MLS',ncaaf:'NCAA FB',ncaam:'NCAA MBB',ncaaw:'NCAA WBB',ncaabb:'NCAA BASE'};
+// a team is found by its number when it has one (college), else by its code
+function find(list,a,id){return list.find(x=>(id&&x.id)?x.id==id:x.abbr.toLowerCase()==a.toLowerCase());}
+function logo(l,a,id){const c=cache[l];if(!c)return '';const t=find(c,a,id);return t?t.logo:'';}
+function draw(){
+  const L=$('list');L.innerHTML='';
+  if(!teams.length)L.innerHTML='<p>No teams yet. Without any, the Orb shows the Hurricanes and the Devils.</p>';
+  teams.forEach((t,i)=>{
+    const r=document.createElement('div');r.className='row';
+    const src=logo(t.league,t.abbr,t.id);
+    r.innerHTML=(src?'<img src="'+src+'">':'')+'<span class=nm>'+(t.name||t.abbr.toUpperCase())+'<span class=lg>'+(LNAME[t.league]||t.league.toUpperCase())+' '+t.abbr.toUpperCase()+'</span></span>'+
+      '<button class=mv title="Up">&#9650;</button><button class=mv title="Down">&#9660;</button><button class=x title="Remove">&#10005;</button>';
+    const b=r.querySelectorAll('button');
+    b[0].onclick=()=>{if(i>0){[teams[i-1],teams[i]]=[teams[i],teams[i-1]];draw();}};
+    b[1].onclick=()=>{if(i<teams.length-1){[teams[i+1],teams[i]]=[teams[i],teams[i+1]];draw();}};
+    b[2].onclick=()=>{teams.splice(i,1);draw();};
+    L.appendChild(r);
+  });
+  $('add').disabled=!$('tm').value||teams.length>=MAX;
+}
+async function league(l){
+  if(cache[l])return cache[l];
+  // the Orb fetches the list in the background: 202 means ask again shortly
+  for(let i=0;i<20;i++){
+    const r=await fetch('/teamlist?league='+l);
+    if(r.status==200){cache[l]=(await r.json()).sort((a,b)=>a.name.localeCompare(b.name));return cache[l];}
+    if(r.status!=202)throw new Error('HTTP '+r.status);
+    if(i==1)say('Getting the '+l.toUpperCase()+' teams...');
+    await new Promise(z=>setTimeout(z,1000));
+  }
+  throw new Error('the Orb could not reach ESPN');
+}
+$('lg').onchange=async()=>{
+  const l=$('lg').value,s=$('tm');s.disabled=true;s.innerHTML='<option value="">Team...</option>';$('prev').style.display='none';
+  if(!l){draw();return;}
+  try{const list=await league(l);
+    list.forEach((t,k)=>{const o=document.createElement('option');o.value=k;o.textContent=t.name;s.appendChild(o);});
+    s.disabled=false;say('');draw();
+  }catch(e){say('Could not load the '+l.toUpperCase()+' teams ('+e.message+'). Try again, or use "Team not in the list?" below.','bad');}
+};
+$('tm').onchange=()=>{
+  const l=$('lg').value,t=(cache[l]||[])[$('tm').value],src=t?t.logo:'',p=$('prev');
+  if(src){p.src=src;p.style.display='inline';}else p.style.display='none';draw();
+};
+function push(l,a,name,id){
+  a=a.trim().toLowerCase();id=(id||'').trim();
+  if(!/^[a-z0-9]{1,7}$/.test(a)){say('A team code is letters and numbers, up to seven.','bad');return;}
+  if(id&&!/^[0-9]{1,7}$/.test(id)){say('A team number is digits only.','bad');return;}
+  if(COLLEGE(l)&&!id){say('A college team needs its ESPN team number.','bad');return;}
+  if(teams.length>=MAX){say('Six teams at most.','bad');return;}
+  if(teams.some(t=>t.league==l&&(id&&t.id?t.id==id:t.abbr.toLowerCase()==a))){say('Already on the list.','bad');return;}
+  teams.push({league:l,abbr:a,id:id,name:name||''});say('');draw();
+}
+$('add').onclick=()=>{const l=$('lg').value,t=(cache[l]||[])[$('tm').value];if(t)push(l,t.abbr,t.name,COLLEGE(l)?t.id:'');};
+// espn.com sport folder -> the Orb's league code
+const SPORT={nfl:'nfl',nhl:'nhl',nba:'nba',mlb:'mlb',wnba:'wnba','college-football':'ncaaf',
+  'mens-college-basketball':'ncaam','womens-college-basketball':'ncaaw','college-baseball':'ncaabb'};
+// ".../college-football/team/_/id/151/east-carolina-pirates" or ".../nfl/team/_/name/dal/dallas-cowboys"
+function fromUrl(u){
+  const m=u.match(/espn\.com\/([a-z-]+)\/team\/_\/(name|id)\/([a-z0-9]+)(?:\/([a-z0-9-]+))?/i);
+  if(!m)return null;
+  const l=SPORT[m[1].toLowerCase()];if(!l)return null;
+  const slug=(m[4]||'').split('-').filter(Boolean);
+  const name=slug.map(w=>w[0].toUpperCase()+w.slice(1)).join(' ')||('Team '+m[3]);
+  if(m[2].toLowerCase()=='name')return {l,a:m[3],id:'',name};
+  // college addresses carry only the number: a stand-in code from the name's initials, which
+  // the Orb replaces with ESPN's own ("ECU") the first time it reads the team
+  const code=(slug.map(w=>w[0]).join('')||'t').slice(0,4);
+  return {l,a:code,id:m[3],name};
+}
+$('madd').onclick=()=>{
+  const t=fromUrl($('murl').value.trim());
+  if(!t){say('That does not look like an espn.com team address (".../team/_/id/151/..." or ".../team/_/name/dal/...").','bad');return;}
+  push(t.l,t.a,t.name,t.id);
+  if(!$('msg').textContent)$('murl').value='';
+};
+$('save').onclick=async()=>{
+  const body=teams.map(t=>t.league+' '+t.abbr.toLowerCase()+(t.id&&COLLEGE(t.league)?' '+t.id:'')).join('\n')+'\n';
+  try{const r=await fetch('/teamsave',{method:'POST',headers:{'Content-Type':'text/plain'},body});
+    const t=await r.text();
+    if(r.ok)say('Saved. The Orb is fetching the games now.','ok');else say('Not saved: '+t,'bad');
+  }catch(e){say('Not saved: '+e,'bad');}
+};
+(async()=>{
+  try{const r=await fetch('/teams.json');teams=await r.json();}catch(e){teams=[];}
+  draw();
+  // logos and full names for what is already chosen
+  for(const l of [...new Set(teams.map(t=>t.league))].filter(l=>!COLLEGE(l))){
+    try{const list=await league(l);teams.forEach(t=>{if(t.league==l){const m=find(list,t.abbr,t.id);if(m)t.name=m.name;}});}catch(e){}
+  }
+  draw();
+})();
+</script>
+)HTML";
+
 static const char ROOT_TAIL[] PROGMEM =
     "</dl></div>"
     "<div class=card>"
     "<a class=b href='/install'>Install a theme file</a>"
+    "<a class=b href='/teams'>Scores teams</a>"
     // Upstream 2.16.64 guarded this link: with no OTA partition the page it points at
     // 404s, so advertising it is a lie. Preserved here because this function moved into a
     // PROGMEM literal in the same release — string-literal concatenation takes a #if
@@ -2754,6 +2910,7 @@ void setup() {
     psram_mark("boot start");
     sdcard::begin();
     psram_mark("after sdcard");
+    score_store::begin();             // the Scores teams from /teams.txt, and their cached schedules
 
     if (PIN_LCD_SCLK < 0 || PIN_I2C_SDA < 0) {
         Serial.println("[!] Pins in config.h are still -1. Copy them from the Waveshare demo.");
@@ -2945,6 +3102,11 @@ void setup() {
                    tickerview::onPress, tickerview::onTurn, false,
                    tickerview::onEnter, tickerview::onExit, !theme_style::apps().ticker);  // turn steps the watchlist; onEnter takes the strip canvas only when the design curves it
 #endif
+    // Scores, built when opened like Headlines: nothing of it is held while another screen
+    // shows. Not on a theme's roster (Orb Studio does not know it), so always offered.
+    app_shell::addLazy("Scores", scoresview::build, scoresview::destroy,
+                       scoresview::onPress, nullptr, false,
+                       scoresview::onEnter, scoresview::onExit, false);
     // Settings is built the first time somebody opens it, not here. It was the single
     // largest holder of internal RAM on the device — 909 LVGL allocations and ~24 KB,
     // measured 2026-10-06 — for the screen reached least often, and internal RAM is the
@@ -3534,6 +3696,73 @@ void setup() {
     // The page that drives /sdput from a browser, so a theme can arrive over WiFi from any
     // device on the network rather than only down a USB cable from a Chromium desktop.
     g_web.on("/install", []{ g_web.send_P(200, "text/html", INSTALL_PAGE); });
+    g_web.on("/teams", []{ g_web.send_P(200, "text/html", TEAMS_PAGE); });
+    // A league's teams for the page's dropdown, fetched by the Orb itself: the browser asking
+    // ESPN directly was blocked in some browsers (CORS / tracking protection). 202 = still
+    // being fetched by the network task, ask again in a moment.
+    g_web.on("/teamlist", []{
+        String lg = g_web.arg("league");
+        lg.toLowerCase();
+        if (lg.startsWith("ncaa")) { g_web.send(404, "text/plain", "college teams are added by their espn.com address"); return; }
+        const char *json = score_store::team_list(lg.c_str());
+        if (json) g_web.send(200, "application/json", json);
+        else g_web.send(202, "text/plain", "fetching");
+    });
+    // The chosen teams, for the page above: league, code and the name the Orb knows.
+    g_web.on("/teams.json", []{
+        String out = "[";
+        char lg[8], ab[8], id[8], nm[32];
+        for (int i = 0; score_store::entry(i, lg, ab, id, nm, sizeof(nm)); ++i) {
+            for (char *c = nm; *c; ++c) if (*c == '"' || *c == '\\') *c = '\'';
+            if (i) out += ",";
+            out += "{\"league\":\""; out += lg; out += "\",\"abbr\":\""; out += ab;
+            out += "\",\"id\":\""; out += id;
+            out += "\",\"name\":\""; out += nm; out += "\"}";
+        }
+        out += "]";
+        g_web.send(200, "application/json", out);
+    });
+    // Save the list as /teams.txt. Every line is checked here, not trusted from the page:
+    // a known league, then a code of letters and digits, six lines at most.
+    g_web.on("/teamsave", HTTP_POST, []{
+        const String body = g_web.arg("plain");
+        String clean;
+        int n = 0, from = 0;
+        while (from <= (int)body.length() && n < 6) {
+            int to = body.indexOf('\n', from);
+            if (to < 0) to = body.length();
+            String line = body.substring(from, to);
+            from = to + 1;
+            line.trim();
+            if (!line.length()) continue;
+            const int sp = line.indexOf(' ');
+            if (sp <= 0) { g_web.send(400, "text/plain", "bad line: " + line); return; }
+            String lg = line.substring(0, sp), ab = line.substring(sp + 1), id;
+            ab.trim();
+            const int sp2 = ab.indexOf(' ');
+            if (sp2 > 0) { id = ab.substring(sp2 + 1); ab = ab.substring(0, sp2); id.trim(); }
+            lg.trim(); ab.trim(); lg.toLowerCase(); ab.toLowerCase();
+            const bool college = lg == "ncaaf" || lg == "ncaam" || lg == "ncaaw" || lg == "ncaabb";
+            const bool lgOk = college || lg == "nfl" || lg == "nhl" || lg == "nba" || lg == "mlb" || lg == "wnba" || lg == "mls";
+            bool abOk = ab.length() >= 1 && ab.length() <= 7;
+            for (int i = 0; abOk && i < (int)ab.length(); ++i) abOk = isalnum((unsigned char)ab[i]);
+            // college teams are told apart by ESPN's team number, so they must have one
+            bool idOk = id.length() <= 7 && (!college || id.length() >= 1);
+            for (int i = 0; idOk && i < (int)id.length(); ++i) idOk = isdigit((unsigned char)id[i]);
+            if (!lgOk || !abOk || !idOk) { g_web.send(400, "text/plain", "bad team: " + line); return; }
+            clean += lg + " " + ab;
+            if (id.length()) clean += " " + id;
+            clean += "\n";
+            ++n;
+        }
+        if (!theme_sd::write_whole("/teams.txt", (const uint8_t *)clean.c_str(), clean.length())) {
+            g_web.send(500, "text/plain", "could not write teams.txt (is the SD card in?)");
+            return;
+        }
+        Serial.printf("[scores] teams.txt saved from the web page: %d team(s)\n", n);
+        score_store::reload();
+        g_web.send(200, "text/plain", "ok");
+    });
     // What is on the card, for the page above. The same answer the serial link gives, which
     // matters now that a cable is optional: Studio is served over HTTPS and can never call
     // this, so the device's own page is the only place the card's contents can be seen.
@@ -3827,6 +4056,7 @@ void loop() {
     // moves on the same clock as everything else the display does and cannot drift against
     // it. tick() returns immediately unless the theme actually curves its strip.
     tickerview::tick();
+    scoresview::tick();
     if (g_wxRadarDirty) {
         g_wxRadarDirty = false;
         ui_on_data_updated();

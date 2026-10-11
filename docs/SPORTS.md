@@ -1,0 +1,68 @@
+# Scores screen (Orbos-Sports)
+
+This build is Zion Brock's **The Orb OS 2.17.01** with one addition: a **Scores** screen for the
+teams you follow. Everything else is Zion's firmware, unchanged.
+
+## What it shows
+
+- **Score page** for each team: both teams' logos with their names, the score, and the period
+  and clock while a game is live; the final (and the day it was played) when there is no game
+  today; or the day and time of the next game.
+- **Upcoming page**: the team's next six games, with the opponent's logo, day, time, and home
+  or away.
+- Press the knob (or tap) to go: a team's score → its upcoming games → the next team.
+
+Leagues: **NFL, NHL, NBA, MLB, WNBA, MLS**, and college **football, men's and women's
+basketball, and baseball**. Up to six teams. Without any set, it shows the Carolina Hurricanes
+and the New Jersey Devils.
+
+## Picking teams
+
+With the Orb on your WiFi, open **http://theorb.local/teams** (or the Orb's IP address followed
+by `/teams`). There is also a **Scores teams** button on the Orb's main web page.
+
+- **Pro teams:** choose the league, then the team, and press **Add**.
+- **College teams (or any team):** open the team on espn.com and paste its address, for example
+  `https://www.espn.com/college-football/team/_/id/151/east-carolina-pirates`, then **Add**.
+- Use ▲ ▼ to order them and ✕ to remove one, then **Save**. The Orb fetches the new teams'
+  games straight away.
+
+The list is stored on the SD card as `/teams.txt`, one team per line (`nhl car`, `nfl dal`,
+college teams with ESPN's team number: `ncaaf ecu 151`). You can also edit that file by hand
+and restart.
+
+From a computer's command line, `tools/find_team.py` finds a team and can add it:
+
+```
+python3 tools/find_team.py ncaaf east carolina                    # prints: ncaaf ecu 151
+python3 tools/find_team.py ncaaf east carolina --add 192.168.1.50 # and adds it to the Orb
+```
+
+## Where the data comes from
+
+ESPN's public scoreboard, team pages and schedules (`site.api.espn.com`, plain HTTP, no key).
+
+- Live games refresh every 30 seconds while the Scores screen is showing, every 2 minutes
+  otherwise; with no game on, every 30 minutes.
+- Schedules (the upcoming page and the last result) are checked hourly and right after a game
+  ends, and kept on the SD card in `/scores`, so they appear at once after a restart.
+- Team logos are downloaded once (ESPN's dark-background versions) and kept in `/logos` on the
+  card. To use your own, put a PNG there named `<league>_<team>.png` (for example
+  `nhl_car.png`; college teams by number: `ncaaf_151.png`).
+
+## The serial log
+
+Lines starting `[scores]` and `[logos]` say what was fetched, for example:
+
+```
+[scores] nhl CAR: schedule 312 KB, 6 upcoming, last game Final
+[scores] nhl CAR: CAR 0 @ PHI 0  Sun, October 11th at 7:00 PM EDT  (next look in ...)
+[logos] nhl_car: downloaded
+```
+
+## Files added or changed
+
+New: `src/score_store.*` (data), `src/scores_view.*` (screen), `src/logo_store.*` (logos),
+`src/orb_empty_img.h`, `tools/find_team.py`, this file. Changed: `src/main.cpp` (screen
+registration, network step, the `/teams` page), `src/app_shell.h` (one slot),
+`src/theme_sd.*` (small file writes), `src/sim_main.cpp` and `platformio.ini` (simulator).
