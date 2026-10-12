@@ -18,6 +18,13 @@ Rules for a section, all of them learned from what reads badly on that card:
 
 ---
 
+## 2.17.01-sports5
+
+- Football (soccer) clubs show their upcoming matches: ESPN lists a club's results and its
+  fixtures separately, and only the results were being read
+
+---
+
 ## 2.17.01-sports4
 
 - Football (soccer): the Premier League, La Liga, Bundesliga, Serie A, Ligue 1 and the

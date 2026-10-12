@@ -319,7 +319,7 @@ bool http_get(const char *url, Payload &body) {
         if (!league) return false;
         const char *tm = strstr(url, "/teams/");
         std::string rest = tm ? tm + 7 : strstr(url, "/teams?") ? "teams" : "scoreboard";   // "car", "car/schedule", "teams"
-        for (char &ch : rest) if (ch == '/') ch = '_';
+        for (char &ch : rest) if (ch == '/' || ch == '?' || ch == '=') ch = '_';
         std::string path = std::string(dir) + "/" + league + "_" + rest + ".json";
         FILE *f = fopen(path.c_str(), "rb");
         if (!f) return false;
@@ -516,7 +516,7 @@ bool parse_team_page(const char *json, size_t len, const char *league, const cha
     return false;
 }
 
-bool parse_schedule(const char *json, size_t len, const char *league, const char *abbr, long now) {
+bool parse_schedule(const char *json, size_t len, const char *league, const char *abbr, long now, bool merge) {
     JSON_DOC(filter);
     game_filter(filter["events"][0].to<JsonObject>());   // whole games: the last one is shown with its score
     JSON_DOC(doc);
@@ -525,11 +525,13 @@ bool parse_schedule(const char *json, size_t len, const char *league, const char
     for (int i = 0; i < s_n; ++i) {
         Team &t = s_work[i];
         if (strcmp(t.league, league) || strcasecmp(t.abbr, abbr)) continue;
-        t.nextN = 0;
-        t.haveLast = false;
-        t.haveToday = false;
-        long lastStart = 0;
-        s_schedStale = false;
+        if (!merge) {
+            t.nextN = 0;
+            t.haveLast = false;
+            t.haveToday = false;
+            s_schedStale = false;
+        }
+        long lastStart = t.haveLast ? t.last.start : 0;
         for (JsonVariantConst e : doc["events"].as<JsonArrayConst>()) {
             JsonVariantConst cp = e["competitions"][0];
             const char *state = cp["status"]["type"]["state"] | "pre";
@@ -561,8 +563,15 @@ bool parse_schedule(const char *json, size_t len, const char *league, const char
                 copy(u.oppId, sizeof(u.oppId), k["team"]["id"] | "");
                 copy(u.oppName, sizeof(u.oppName), k["team"]["shortDisplayName"] | (k["team"]["displayName"] | ab));
             }
-            if (u.opp[0]) ++t.nextN;
+            bool dup = false;                         // already found by the other request
+            for (int j = 0; j < t.nextN && !dup; ++j) dup = t.next[j].start == u.start && !strcmp(t.next[j].opp, u.opp);
+            if (u.opp[0] && !dup) ++t.nextN;
         }
+        // soonest first, whichever request each game came from
+        for (int a = 1; a < t.nextN; ++a)
+            for (int b = a; b > 0 && t.next[b].start < t.next[b - 1].start; --b) {
+                const Upcoming tmp = t.next[b]; t.next[b] = t.next[b - 1]; t.next[b - 1] = tmp;
+            }
         return true;
     }
     return false;
@@ -769,7 +778,16 @@ bool fetchStep() {
             char ab[8]; team_key(s_work[i], ab);
             snprintf(url, sizeof(url), "http://site.api.espn.com/apis/site/v2/sports/%s/teams/%s/schedule", path_of(s_work[i].league), ab);
             Payload body;
-            const bool got = http_get(url, body) && parse_schedule(body.c_str(), body.length(), s_work[i].league, s_work[i].abbr, now);
+            bool got = http_get(url, body) && parse_schedule(body.c_str(), body.length(), s_work[i].league, s_work[i].abbr, now);
+            // A football club's schedule address gives its results; its fixtures (the games
+            // still to come) need ?fixture=true. Both are read and merged.
+            if (got && is_soccer(s_work[i].league)) {
+                char furl[200];
+                snprintf(furl, sizeof(furl), "%s?fixture=true", url);
+                Payload fx;
+                if (http_get(furl, fx))
+                    parse_schedule(fx.c_str(), fx.length(), s_work[i].league, s_work[i].abbr, now, true);
+            }
             s_schedAt[i] = (now_ms() + (!got ? SCHED_RETRY_MS : s_schedStale ? SCHED_STALE_MS : SCHED_MS)) | 1;
             if (got) { cache_save(s_work[i], now); s_cacheAt[i] = now; }
             if (got) Serial.printf("[scores] %s %s: schedule %u KB, %d upcoming, last game %s\n", s_work[i].league, s_work[i].abbr,

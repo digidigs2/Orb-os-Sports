@@ -105,7 +105,9 @@ long updatedAt();               // unix seconds of the last good refresh, 0 if n
 // `league` is the league the response belongs to.
 bool parse_scoreboard(const char *json, size_t len, const char *league);
 bool parse_team_page(const char *json, size_t len, const char *league, const char *abbr);
-bool parse_schedule(const char *json, size_t len, const char *league, const char *abbr, long now);
+// merge: add to what an earlier call found instead of starting again (football clubs read
+// their results and their fixtures as two requests; see fetchStep).
+bool parse_schedule(const char *json, size_t len, const char *league, const char *abbr, long now, bool merge = false);
 // Unix seconds from ESPN's "2026-10-17T23:00Z" (seconds optional). 0 if unreadable.
 long parse_time(const char *iso);
 
