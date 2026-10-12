@@ -1,5 +1,6 @@
 #include "ticker_view.h"
 #include "ticker.h"
+#include "orb_empty_img.h"
 #include "theme_style.h"
 #include "theme_font.h"
 #include "curved_text.h"
@@ -395,7 +396,7 @@ void onEnter() {
 void onExit() {
     // The picture goes back with everything else. 424 KB is not a thing to hold for a screen
     // nobody is looking at.
-    if (s_plate) { lv_img_set_src(s_plate, nullptr); show(s_plate, false); }
+    if (s_plate) { lv_img_set_src(s_plate, orb_empty_img()); show(s_plate, false); }
     plate_sprite::release(s_plateArt);
     // Delete the object rather than handing it a null buffer. LVGL does not accept the
     // latter and wedges the UI thread on the next app switch, which cost two evenings and

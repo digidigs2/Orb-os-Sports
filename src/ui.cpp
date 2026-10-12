@@ -4,6 +4,7 @@
 #include "theme_style.h"
 #include "orb_text_case.h"   // ALL CAPS on a finished line, THEME_CAPS 53
 #include "plate_sprite.h"
+#include "orb_empty_img.h"
 #ifndef ARDUINO
 // The weather map's text canvas is allocated with the PSRAM allocator, which the simulator
 // does not have. Plain malloc stands in: there is only one kind of memory on a desktop, and
@@ -493,7 +494,7 @@ static void wx_text_refresh(void) {
         // 434 KB of PSRAM for a canvas it never marks.
         if (s_wxTextBuf) {
             if (s_wxTextCanvas) {
-                lv_img_set_src(s_wxTextCanvas, (const void *)NULL);   // detach before the free
+                lv_img_set_src(s_wxTextCanvas, orb_empty_img());   // detach before the free
                 lv_obj_add_flag(s_wxTextCanvas, LV_OBJ_FLAG_HIDDEN);
             }
             heap_caps_free(s_wxTextBuf);
@@ -1572,7 +1573,7 @@ void ui_weather_art_attach(void) {
 
 void ui_weather_art_release(void) {
     if (s_wxPlate) {
-        lv_img_set_src(s_wxPlate, nullptr);
+        lv_img_set_src(s_wxPlate, orb_empty_img());
         lv_obj_add_flag(s_wxPlate, LV_OBJ_FLAG_HIDDEN);
     }
     plate_sprite::release(s_wxPlateArt);

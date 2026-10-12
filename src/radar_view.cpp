@@ -4,6 +4,7 @@
 //   THEME_ORB   : Orb scope: green gradient, square grid, the 7 nearest
 //                    aircraft as yellow balls (emitting waves) + off-range arrows.
 #include "radar_view.h"
+#include "orb_empty_img.h"
 #include "display.h"   // display_lvgl_us(): see the frame profiler below
 #include "curved_text.h"
 #include "app_theme.h"
@@ -497,7 +498,9 @@ static bool canvas_acquire(lv_obj_t *canvas, lv_color_t *&buf, const char *tag) 
 static void canvas_release(lv_obj_t *canvas, lv_color_t *&buf) {
     if (!buf) return;
     if (canvas) {
-        lv_img_set_src(canvas, (const void *)NULL);   // detach before freeing: LVGL must never repaint from a freed buffer
+        // Detach before freeing: LVGL must never repaint from a freed buffer. Pointed at an
+        // empty image rather than NULL, which LVGL accepts but logs as an "unknown type".
+        lv_img_set_src(canvas, orb_empty_img());
         lv_obj_add_flag(canvas, LV_OBJ_FLAG_HIDDEN);
     }
 #if defined(ESP_PLATFORM)
@@ -2965,8 +2968,13 @@ static void refresh_custom_text() {
     // ship a selection line and have the Orb refuse to draw it, for no reason it could see
     // or state. Exactly the bug the clock's own text1/text2 had (see clock_view.cpp), and
     // exactly the same fix: the theme decides, at runtime.
+    // `need` is whether the THEME has any of these lines at all, not whether one has
+    // something to say right now. Gating on the selection freed the 636 KB canvas in the
+    // gap every time auto-select moved to the next aircraft and allocated it again a moment
+    // later (every ~7 s), churning PSRAM and logging an LVGL warning on each release. With no
+    // selection the canvas is simply cleared below, and the selection lines skip themselves.
     bool need = false;
-    if (have) for (int i = 0; i < 3; ++i) if (rs.rtext[i].show) need = true;
+    for (int i = 0; i < 3; ++i) if (rs.rtext[i].show) need = true;
     if (rs.rtext[3].show) need = true;   // the range banner is scope-wide, selection or not
     if (rs.locText.show) need = true;    // and so is the location banner (THEME_CAPS 54)
     // The card, and where it sits. Placed before the text so the banners riding it have a
