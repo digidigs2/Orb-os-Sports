@@ -334,7 +334,8 @@ bool http_get(const char *url, Payload &body) {
 }
 
 // ---------------------------------------------------------------- schedule cache
-// /scores/<league>_<team>.bin: the parsed schedule (upcoming games, the last result), so a
+// /scores/<league>_<team>.bin (magic SCH3; SCH2 files were saved before football clubs'
+// fixtures were read, so are ignored): the parsed schedule (upcoming games, the last result), so a
 // restart shows them at once and does not fetch again within the hour. Raw struct, guarded by
 // a magic and the record size: a firmware whose layout differs simply ignores old files.
 struct CacheRec {
@@ -359,7 +360,7 @@ void cache_save(const Team &t, long now) {
     CacheRec *c = (CacheRec *)ext_alloc(sizeof(CacheRec));
     if (!c) return;
     memset(c, 0, sizeof(*c));
-    memcpy(c->magic, "SCH2", 4);
+    memcpy(c->magic, "SCH3", 4);
     c->size = sizeof(CacheRec);
     c->savedAt = now;
     memcpy(c->next, t.next, sizeof(c->next));
@@ -382,7 +383,7 @@ long cache_load(Team &t) {
     if (!b) return 0;
     long at = 0;
     const CacheRec *c = (const CacheRec *)b;
-    if (len == sizeof(CacheRec) && !memcmp(c->magic, "SCH2", 4) && c->size == sizeof(CacheRec) &&
+    if (len == sizeof(CacheRec) && !memcmp(c->magic, "SCH3", 4) && c->size == sizeof(CacheRec) &&
         c->nextN >= 0 && c->nextN <= MAX_UPCOMING) {
         memcpy(t.next, c->next, sizeof(t.next));
         t.nextN = c->nextN;
@@ -770,8 +771,9 @@ bool fetchStep() {
         // before the start until the game is final.
         const bool collegeLive = college && ((w.haveToday && w.today.state != FINAL) ||
                                  (w.nextN && now > 1700000000 && w.next[0].start - now < 30 * 60));
-        // After a restart: a cached schedule younger than an hour is still good.
-        if (!s_schedAt[i] && s_cacheAt[i] && now > 1700000000 && now - s_cacheAt[i] < (long)(SCHED_MS / 1000))
+        // After a restart: a cached schedule younger than an hour is still good, unless it
+        // has no upcoming games, which is more often a bad read than a finished season.
+        if (!s_schedAt[i] && s_cacheAt[i] && w.nextN && now > 1700000000 && now - s_cacheAt[i] < (long)(SCHED_MS / 1000))
             s_schedAt[i] = (now_ms() + (uint32_t)(SCHED_MS - (now - s_cacheAt[i]) * 1000)) | 1;
         const bool due = justEnded || collegeLive || !s_schedAt[i] || (int32_t)(now_ms() - s_schedAt[i]) >= 0;
         if (due) {
@@ -780,13 +782,18 @@ bool fetchStep() {
             Payload body;
             bool got = http_get(url, body) && parse_schedule(body.c_str(), body.length(), s_work[i].league, s_work[i].abbr, now);
             // A football club's schedule address gives its results; its fixtures (the games
-            // still to come) need ?fixture=true. Both are read and merged.
-            if (got && is_soccer(s_work[i].league)) {
+            // still to come) need ?fixture=true. Both are read and merged, and the fixtures
+            // are read even when the results were not, since they are what the page lists.
+            if (is_soccer(s_work[i].league)) {
                 char furl[200];
                 snprintf(furl, sizeof(furl), "%s?fixture=true", url);
                 Payload fx;
-                if (http_get(furl, fx))
-                    parse_schedule(fx.c_str(), fx.length(), s_work[i].league, s_work[i].abbr, now, true);
+                const int before = got ? s_work[i].nextN : 0;
+                const bool fgot = http_get(furl, fx) &&
+                                  parse_schedule(fx.c_str(), fx.length(), s_work[i].league, s_work[i].abbr, now, got);
+                Serial.printf("[scores] %s %s: fixtures %s, %u KB, %d new\n", s_work[i].league, s_work[i].abbr,
+                              fgot ? "read" : "FAILED", (unsigned)(fx.length() / 1024), fgot ? s_work[i].nextN - before : 0);
+                got = got || fgot;
             }
             s_schedAt[i] = (now_ms() + (!got ? SCHED_RETRY_MS : s_schedStale ? SCHED_STALE_MS : SCHED_MS)) | 1;
             if (got) { cache_save(s_work[i], now); s_cacheAt[i] = now; }

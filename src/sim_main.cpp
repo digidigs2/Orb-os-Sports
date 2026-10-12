@@ -366,9 +366,12 @@ static void sdl_mouse_read(lv_indev_drv_t *drv, lv_indev_data_t *data) {
         }
         return;
     }
-    data->point.x = x;
-    data->point.y = y;
-    data->state = down ? LV_INDEV_STATE_PRESSED : LV_INDEV_STATE_RELEASED;
+    // The window is wider than the 466 screen; off it, the mouse is not touching anything.
+    // (Passing the raw x made LVGL warn "X is 520..." on every read.)
+    const bool on = x >= 0 && x < 466 && y >= 0 && y < 466;
+    data->point.x = (lv_coord_t)(x < 0 ? 0 : x > 465 ? 465 : x);
+    data->point.y = (lv_coord_t)(y < 0 ? 0 : y > 465 ? 465 : y);
+    data->state = down && on ? LV_INDEV_STATE_PRESSED : LV_INDEV_STATE_RELEASED;
 }
 
 // Draw the live 466 framebuffer into the round lens, cropped to a circle. Maps
