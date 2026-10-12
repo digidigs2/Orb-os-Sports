@@ -18,6 +18,13 @@ Rules for a section, all of them learned from what reads badly on that card:
 
 ---
 
+## 2.17.01-sports3
+
+- Scores load in the desktop simulator: ESPN refused the simulator's name for itself (it
+  contained a web address). The Orb and the simulator now introduce themselves the same way
+
+---
+
 ## 2.17.01-sports2
 
 - The Flight Tracker no longer frees and rebuilds a large picture layer each time it moves

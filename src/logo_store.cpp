@@ -284,7 +284,7 @@ bool fetchStep() {
         const bool col = college(lg);
         snprintf(url, sizeof(url), "http://a.espncdn.com/combiner/i?img=/i/teamlogos/%s/%s/%s.png&w=%d&h=%d&transparent=true",
                  col ? "ncaa" : lg, v, col ? w.id : ab, SIZE, SIZE);
-        if (net_fetch_psram(url, ADSB_USER_AGENT, &data, &got, MAX_FILE, 6000, 10000) && got > 8 &&
+        if (net_fetch_psram(url, ESPN_USER_AGENT, &data, &got, MAX_FILE, 6000, 10000) && got > 8 &&
             !memcmp(data, "\x89PNG", 4)) break;
         if (data) { heap_caps_free(data); data = nullptr; }
     }

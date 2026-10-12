@@ -7,7 +7,7 @@
 // "1.4.2", said "up to date", and left an Orb missing everything in that list. THEME_CAPS
 // exists because this stopped moving; it covers theme settings and nothing else, so a new
 // command or a deleted screen is invisible to it. Move this too.
-#define FW_VERSION "2.17.01-sports2"   // shown on the web config page + Stats screen
+#define FW_VERSION "2.17.01-sports3"   // shown on the web config page + Stats screen
 // Edit pins below: replace every -1 with the value from the Waveshare factory demo
 // (see docs/HARDWARE.md and docs/SETUP.md). Do NOT guess them.
 
@@ -225,6 +225,10 @@ static const float RANGE_STEPS_KM[] = {10.0f, 20.0f, 30.0f, 50.0f, 100.0f};
 // imagery, route lookup, photos and the news gateway. Kept as an alias rather than renamed
 // at all nine call sites, which would be a large diff to say one small thing.
 #define ADSB_USER_AGENT     ORB_USER_AGENT
+// ESPN (the Scores screen) refuses ORB_USER_AGENT with 403: its edge treats a User-Agent
+// carrying a "+https://" contact address as a bot. Measured 2026-10-12: the full string 403,
+// "TheOrbOS/<version>" 200. So ESPN requests send the short form, still naming the firmware.
+#define ESPN_USER_AGENT     "TheOrbOS/" FW_VERSION
 #define ADSB_HTTPS_INSECURE 1               // 1 = setInsecure() (hobby). 0 = use pinned root CA.
 // How many distinct addresses to keep for the feed. Rate limiting is per-edge, so having
 // somewhere else to ask is worth more than any backoff. Learned by DNS at runtime.

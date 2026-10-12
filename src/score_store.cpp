@@ -261,7 +261,10 @@ bool http_get(const char *url, Payload &body) {
     http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
     http.useHTTP10(true);        // no chunked encoding: the body arrives as plain bytes
     if (!http.begin(client, url)) return false;
-    http.addHeader("User-Agent", ADSB_USER_AGENT);
+    // setUserAgent, not addHeader: HTTPClient silently drops a "User-Agent" passed to
+    // addHeader and sends its own "ESP32HTTPClient", so the device and the simulator used to
+    // introduce themselves differently (and the simulator's longer name was refused).
+    http.setUserAgent(ESPN_USER_AGENT);
     const int status = http.GET();
     if (status != 200) {
         Serial.printf("[scores] %s: HTTP %d\n", url, status);
@@ -317,7 +320,7 @@ bool http_get(const char *url, Payload &body) {
         return body.len > 0;
     }
     std::string s;
-    return native_https_get(url, ADSB_USER_AGENT, s, 10000) && !s.empty() && body.append(s.data(), s.size());
+    return native_https_get(url, ESPN_USER_AGENT, s, 10000) && !s.empty() && body.append(s.data(), s.size());
 #endif
 }
 
