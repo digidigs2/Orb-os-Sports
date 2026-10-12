@@ -90,7 +90,8 @@ volatile bool s_visible = false;
 volatile bool s_reload = false;
 
 // League team lists for the /teams page (see team_list()). Index = position in LEAGUES.
-constexpr const char *LEAGUES[] = {"nfl", "nhl", "nba", "mlb", "wnba", "mls", "ncaaf", "ncaam", "ncaaw", "ncaabb"};
+constexpr const char *LEAGUES[] = {"nfl", "nhl", "nba", "mlb", "wnba", "mls", "epl", "laliga", "bundes", "seriea", "ligue1", "ucl",
+                                   "ncaaf", "ncaam", "ncaaw", "ncaabb"};
 constexpr int NLEAGUES = sizeof(LEAGUES) / sizeof(LEAGUES[0]);
 char *volatile s_list[NLEAGUES] = {};        // published JSON, PSRAM, never freed
 volatile int   s_listWant = -1;              // league the page is waiting for
@@ -106,6 +107,8 @@ const char *path_of(const char *league) {
     static const struct { const char *k, *v; } map[] = {
         {"nfl", "football/nfl"}, {"nhl", "hockey/nhl"}, {"nba", "basketball/nba"},
         {"mlb", "baseball/mlb"}, {"wnba", "basketball/wnba"}, {"mls", "soccer/usa.1"},
+        {"epl", "soccer/eng.1"}, {"laliga", "soccer/esp.1"}, {"bundes", "soccer/ger.1"},
+        {"seriea", "soccer/ita.1"}, {"ligue1", "soccer/fra.1"}, {"ucl", "soccer/uefa.champions"},
         {"ncaaf", "football/college-football"}, {"ncaam", "basketball/mens-college-basketball"},
         {"ncaaw", "basketball/womens-college-basketball"}, {"ncaabb", "baseball/college-baseball"},
     };
@@ -116,6 +119,12 @@ const char *path_of(const char *league) {
 // College: hundreds of teams, abbreviations that repeat, and a league scoreboard far too big
 // to re-read every 30 seconds. These go by team number and read their own schedule instead.
 bool is_college(const char *league) { return !strncmp(league, "ncaa", 4); }
+
+// Soccer, like college, names its teams by number in ESPN's addresses and logos (Arsenal is
+// 359); its codes repeat across leagues. Unlike college it keeps its league scoreboard: one
+// matchday is a few games.
+bool is_soccer(const char *league) { const char *p = path_of(league); return p && !strncmp(p, "soccer/", 7); }
+bool by_number(const char *league) { return is_college(league) || is_soccer(league); }
 
 void lower(char *s) { for (; *s; ++s) *s = (char)tolower((unsigned char)*s); }
 
@@ -663,10 +672,10 @@ bool save_teams(const char *body, char *err, size_t errLen) {
         const int got = sscanf(line, "%15s %15s %15s %3s", lg, ab, id, extra);
         if (got <= 0) continue;                                  // a blank line
         lower(lg); lower(ab);
-        const bool college = is_college(lg);
+        const bool numbered = by_number(lg);                     // college and soccer
         bool ok = got >= 2 && got <= 3 && league_index(lg) >= 0 && strlen(ab) >= 1 && strlen(ab) <= 7;
         for (const char *c = ab; ok && *c; ++c) ok = isalnum((unsigned char)*c);
-        ok = ok && strlen(id) <= 7 && (!college || id[0]);       // college teams need their number
+        ok = ok && strlen(id) <= 7 && (!numbered || id[0]);      // college and soccer teams need their number
         for (const char *c = id; ok && *c; ++c) ok = isdigit((unsigned char)*c);
         if (!ok) { snprintf(err, errLen, "bad team: %.40s", line); return false; }
         if (++n > MAX_TEAMS) { snprintf(err, errLen, "six teams at most"); return false; }

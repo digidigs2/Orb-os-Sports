@@ -2,8 +2,8 @@
 
 > **Orbos-Sports** is a fork of Zion Brock's Orb firmware
 > ([Ziplock78/orb-firmware](https://github.com/Ziplock78/orb-firmware)), version 2.17.01, with one
-> addition: a **Scores** screen for the sports teams you follow (NFL, NHL, NBA, MLB, WNBA, MLS and
-> college). Everything else is Zion's firmware, unchanged. See **[docs/SPORTS.md](docs/SPORTS.md)**
+> addition: a **Scores** screen for the sports teams you follow (NFL, NHL, NBA, MLB, WNBA, college,
+> and football: MLS, the Premier League and the big European leagues). Everything else is Zion's firmware, unchanged. See **[docs/SPORTS.md](docs/SPORTS.md)**
 > for the Scores screen and how to pick your teams.
 >
 > **Installing:** build and flash with PlatformIO from this folder:

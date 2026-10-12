@@ -12,7 +12,8 @@ teams you follow. Everything else is Zion's firmware, unchanged.
   or away.
 - Press the knob (or tap) to go: a team's score → its upcoming games → the next team.
 
-Leagues: **NFL, NHL, NBA, MLB, WNBA, MLS**, and college **football, men's and women's
+Leagues: **NFL, NHL, NBA, MLB, WNBA**; football (soccer): **MLS, Premier League, La Liga,
+Bundesliga, Serie A, Ligue 1, Champions League**; and college **football, men's and women's
 basketball, and baseball**. Up to six teams. Without any set, it shows the Carolina Hurricanes
 and the New Jersey Devils.
 
@@ -24,11 +25,14 @@ by `/teams`). There is also a **Scores teams** button on the Orb's main web page
 - **Pro teams:** choose the league, then the team, and press **Add**.
 - **College teams (or any team):** open the team on espn.com and paste its address, for example
   `https://www.espn.com/college-football/team/_/id/151/east-carolina-pirates`, then **Add**.
+- **Football (soccer) clubs:** choose the league and pick the club, or choose the league and
+  paste the club's address (`https://www.espn.com/soccer/team/_/id/384/crystal-palace`): a
+  club's address does not say which league it plays in.
 - Use ▲ ▼ to order them and ✕ to remove one, then **Save**. The Orb fetches the new teams'
   games straight away.
 
 The list is stored on the SD card as `/teams.txt`, one team per line (`nhl car`, `nfl dal`,
-college teams with ESPN's team number: `ncaaf ecu 151`). You can also edit that file by hand
+college and soccer teams with ESPN's team number: `ncaaf ecu 151`, `epl cry 384`). You can also edit that file by hand
 and restart.
 
 From a computer's command line, `tools/find_team.py` finds a team and can add it:

@@ -176,7 +176,11 @@ void paint_game() {
             when_text(g.start, day, sizeof(day), hm, sizeof(hm));
             if (!strcmp(day, "TODAY") || !strcmp(day, "TONIGHT")) day[0] = 0;
         }
-        const char *res = me.score > them.score ? "WIN" : me.score < them.score ? "LOSS" : "";
+        // level at the end: a draw in football (soccer), a tie anywhere else it can happen
+        static const char *const SOCCER[] = {"mls", "epl", "laliga", "bundes", "seriea", "ligue1", "ucl"};
+        bool soccer = false;
+        for (const char *l : SOCCER) if (!strcmp(s_t.league, l)) soccer = true;
+        const char *res = me.score > them.score ? "WIN" : me.score < them.score ? "LOSS" : soccer ? "DRAW" : "TIE";
         if (day[0] && res[0]) snprintf(sub, sizeof(sub), "%s  -  %s %s", day, s_t.abbr, res);
         else if (res[0]) snprintf(sub, sizeof(sub), "%s %s", s_t.abbr, res);
         else snprintf(sub, sizeof(sub), "%s", day);

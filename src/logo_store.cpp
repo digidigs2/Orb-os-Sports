@@ -123,10 +123,17 @@ bool ensure_tables() {
 }
 
 bool college(const char *league) { return !strncmp(league, "ncaa", 4); }
+bool soccer(const char *league) {
+    static const char *const S[] = {"mls", "epl", "laliga", "bundes", "seriea", "ligue1", "ucl"};
+    for (const char *s : S) if (!strcmp(league, s)) return true;
+    return false;
+}
+// Filed by team number rather than code: college and soccer (see score_store's by_number).
+bool numbered(const char *league) { return college(league) || soccer(league); }
 
 // "nhl_car"; college by number, "ncaaf_153": abbreviations repeat across schools
 void make_key(char *out, size_t n, const char *league, const char *abbr, const char *id) {
-    snprintf(out, n, "%s_%s", league, (college(league) && id && id[0]) ? id : abbr);
+    snprintf(out, n, "%s_%s", league, (numbered(league) && id && id[0]) ? id : abbr);
     for (char *c = out; *c; ++c) *c = (char)tolower((unsigned char)*c);
 }
 
@@ -182,7 +189,7 @@ bool decode_fit(const uint8_t *png, size_t len, uint8_t *out) {
 
 void want(const char *league, const char *abbr, const char *id) {
     if (!league[0] || !abbr[0]) return;
-    if (college(league) && !(id && id[0])) return;      // no number, no college logo
+    if (numbered(league) && !(id && id[0])) return;     // no number, no college or soccer logo
     Guard g;
     if (!s_want) return;      // tables come from get() on the UI thread
     for (int i = 0; i < s_wantN; ++i)
@@ -280,10 +287,11 @@ bool fetchStep() {
     static const char *const VARIANTS[] = {"500-dark", "500"};
     uint8_t *data = nullptr; size_t got = 0;
     for (const char *v : VARIANTS) {
-        // college logos live under "ncaa", one folder for every sport, filed by team number
-        const bool col = college(lg);
+        // college logos live under "ncaa" and every football club's under "soccer", filed by
+        // team number; the pro leagues' under their own name, filed by code
+        const bool num = numbered(lg);
         snprintf(url, sizeof(url), "http://a.espncdn.com/combiner/i?img=/i/teamlogos/%s/%s/%s.png&w=%d&h=%d&transparent=true",
-                 col ? "ncaa" : lg, v, col ? w.id : ab, SIZE, SIZE);
+                 college(lg) ? "ncaa" : soccer(lg) ? "soccer" : lg, v, num ? w.id : ab, SIZE, SIZE);
         if (net_fetch_psram(url, ESPN_USER_AGENT, &data, &got, MAX_FILE, 6000, 10000) && got > 8 &&
             !memcmp(data, "\x89PNG", 4)) break;
         if (data) { heap_caps_free(data); data = nullptr; }

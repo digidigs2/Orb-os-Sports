@@ -38,6 +38,8 @@ games straight away. <a href="/">Back</a></p>
   <option value="">League...</option>
   <option value="nfl">NFL</option><option value="nhl">NHL</option><option value="nba">NBA</option>
   <option value="mlb">MLB</option><option value="wnba">WNBA</option><option value="mls">MLS</option>
+  <option value="epl">Premier League</option><option value="laliga">La Liga</option><option value="bundes">Bundesliga</option>
+  <option value="seriea">Serie A</option><option value="ligue1">Ligue 1</option><option value="ucl">Champions League</option>
  </select>
  <select id=tm disabled><option>Team...</option></select>
  <img id=prev alt="">
@@ -49,16 +51,22 @@ games straight away. <a href="/">Back</a></p>
 <p>Open the team on espn.com and paste its address here, for example
 <code>https://www.espn.com/college-football/team/_/id/151/east-carolina-pirates</code>.
 College football, men's and women's basketball and baseball all work, and so does any pro
-team's address.</p>
+team's address. For a football (soccer) club, also pick its league in the list above first:
+its address does not say which league it plays in.</p>
 <div class=bar><input id=murl style="flex:1;min-width:0" placeholder="https://www.espn.com/.../team/_/..."><button class=btn id=madd>Add</button></div>
 <script>
-const PATH={nfl:'football/nfl',nhl:'hockey/nhl',nba:'basketball/nba',mlb:'baseball/mlb',wnba:'basketball/wnba',mls:'soccer/usa.1'};
+const PATH={nfl:'football/nfl',nhl:'hockey/nhl',nba:'basketball/nba',mlb:'baseball/mlb',wnba:'basketball/wnba',mls:'soccer/usa.1',
+  epl:'soccer/eng.1',laliga:'soccer/esp.1',bundes:'soccer/ger.1',seriea:'soccer/ita.1',ligue1:'soccer/fra.1',ucl:'soccer/uefa.champions'};
 const MAX=6;
 let teams=[], cache={};
 const $=id=>document.getElementById(id);
 function say(t,c){$('msg').innerHTML='<span class="'+(c||'')+'">'+t+'</span>';}
 const COLLEGE=l=>l.startsWith('ncaa');
-const LNAME={nfl:'NFL',nhl:'NHL',nba:'NBA',mlb:'MLB',wnba:'WNBA',mls:'MLS',ncaaf:'NCAA FB',ncaam:'NCAA MBB',ncaaw:'NCAA WBB',ncaabb:'NCAA BASE'};
+const SOCCER=l=>(PATH[l]||'').startsWith('soccer/');
+// college and soccer teams are saved with ESPN's team number, which is how they are found
+const NUMBERED=l=>COLLEGE(l)||SOCCER(l);
+const LNAME={nfl:'NFL',nhl:'NHL',nba:'NBA',mlb:'MLB',wnba:'WNBA',mls:'MLS',ncaaf:'NCAA FB',ncaam:'NCAA MBB',ncaaw:'NCAA WBB',ncaabb:'NCAA BASE',
+  epl:'EPL',laliga:'LA LIGA',bundes:'BUNDESLIGA',seriea:'SERIE A',ligue1:'LIGUE 1',ucl:'UCL'};
 // a team is found by its number when it has one (college), else by its code
 function find(list,a,id){return list.find(x=>(id&&x.id)?x.id==id:x.abbr.toLowerCase()==a.toLowerCase());}
 function logo(l,a,id){const c=cache[l];if(!c)return '';const t=find(c,a,id);return t?t.logo:'';}
@@ -106,12 +114,12 @@ function push(l,a,name,id){
   a=a.trim().toLowerCase();id=(id||'').trim();
   if(!/^[a-z0-9]{1,7}$/.test(a)){say('A team code is letters and numbers, up to seven.','bad');return;}
   if(id&&!/^[0-9]{1,7}$/.test(id)){say('A team number is digits only.','bad');return;}
-  if(COLLEGE(l)&&!id){say('A college team needs its ESPN team number.','bad');return;}
+  if(NUMBERED(l)&&!id){say('This team needs its ESPN team number: paste its espn.com address.','bad');return;}
   if(teams.length>=MAX){say('Six teams at most.','bad');return;}
   if(teams.some(t=>t.league==l&&(id&&t.id?t.id==id:t.abbr.toLowerCase()==a))){say('Already on the list.','bad');return;}
   teams.push({league:l,abbr:a,id:id,name:name||''});say('');draw();
 }
-$('add').onclick=()=>{const l=$('lg').value,t=(cache[l]||[])[$('tm').value];if(t)push(l,t.abbr,t.name,COLLEGE(l)?t.id:'');};
+$('add').onclick=()=>{const l=$('lg').value,t=(cache[l]||[])[$('tm').value];if(t)push(l,t.abbr,t.name,NUMBERED(l)?t.id:'');};
 // espn.com sport folder -> the Orb's league code
 const SPORT={nfl:'nfl',nhl:'nhl',nba:'nba',mlb:'mlb',wnba:'wnba','college-football':'ncaaf',
   'mens-college-basketball':'ncaam','womens-college-basketball':'ncaaw','college-baseball':'ncaabb'};
@@ -119,7 +127,10 @@ const SPORT={nfl:'nfl',nhl:'nhl',nba:'nba',mlb:'mlb',wnba:'wnba','college-footba
 function fromUrl(u){
   const m=u.match(/espn\.com\/([a-z-]+)\/team\/_\/(name|id)\/([a-z0-9]+)(?:\/([a-z0-9-]+))?/i);
   if(!m)return null;
-  const l=SPORT[m[1].toLowerCase()];if(!l)return null;
+  let l=SPORT[m[1].toLowerCase()];
+  // ".../soccer/team/_/id/359/arsenal": the league comes from the list above
+  if(m[1].toLowerCase()=='soccer'){l=$('lg').value;if(!SOCCER(l))return {needLeague:true};}
+  if(!l)return null;
   const slug=(m[4]||'').split('-').filter(Boolean);
   const name=slug.map(w=>w[0].toUpperCase()+w.slice(1)).join(' ')||('Team '+m[3]);
   if(m[2].toLowerCase()=='name')return {l,a:m[3],id:'',name};
@@ -130,12 +141,13 @@ function fromUrl(u){
 }
 $('madd').onclick=()=>{
   const t=fromUrl($('murl').value.trim());
+  if(t&&t.needLeague){say('Pick the club\'s league in the list above first (Premier League, La Liga, ...), then Add again.','bad');return;}
   if(!t){say('That does not look like an espn.com team address (".../team/_/id/151/..." or ".../team/_/name/dal/...").','bad');return;}
   push(t.l,t.a,t.name,t.id);
   if(!$('msg').textContent)$('murl').value='';
 };
 $('save').onclick=async()=>{
-  const body=teams.map(t=>t.league+' '+t.abbr.toLowerCase()+(t.id&&COLLEGE(t.league)?' '+t.id:'')).join('\n')+'\n';
+  const body=teams.map(t=>t.league+' '+t.abbr.toLowerCase()+(t.id&&NUMBERED(t.league)?' '+t.id:'')).join('\n')+'\n';
   try{const r=await fetch('/teamsave',{method:'POST',headers:{'Content-Type':'text/plain'},body});
     const t=await r.text();
     if(r.ok)say('Saved. The Orb is fetching the games now.','ok');else say('Not saved: '+t,'bad');

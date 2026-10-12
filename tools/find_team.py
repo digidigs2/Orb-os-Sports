@@ -5,8 +5,8 @@
     python3 tools/find_team.py ncaaf east carolina
     python3 tools/find_team.py nhl hurricanes --add 192.168.1.50
 
-Leagues: nfl nhl nba mlb wnba mls ncaaf ncaam ncaaw ncaabb (college: football, men's and
-women's basketball, baseball). Prints each match as the line teams.txt wants, e.g.
+Leagues: nfl nhl nba mlb wnba, football (soccer) mls epl laliga bundes seriea ligue1 ucl, and
+ncaaf ncaam ncaaw ncaabb (college: football, men's and women's basketball, baseball). Prints each match as the line teams.txt wants, e.g.
 
     ncaaf ecu 151    East Carolina Pirates
 
@@ -23,6 +23,8 @@ import urllib.request
 PATH = {
     "nfl": "football/nfl", "nhl": "hockey/nhl", "nba": "basketball/nba", "mlb": "baseball/mlb",
     "wnba": "basketball/wnba", "mls": "soccer/usa.1",
+    "epl": "soccer/eng.1", "laliga": "soccer/esp.1", "bundes": "soccer/ger.1",
+    "seriea": "soccer/ita.1", "ligue1": "soccer/fra.1", "ucl": "soccer/uefa.champions",
     "ncaaf": "football/college-football", "ncaam": "basketball/mens-college-basketball",
     "ncaaw": "basketball/womens-college-basketball", "ncaabb": "baseball/college-baseball",
 }
@@ -49,7 +51,7 @@ def main():
         print(__doc__)
         sys.exit(1)
     league, words = args[0].lower(), [w.lower() for w in args[1:]]
-    college = league.startswith("ncaa")
+    college = league.startswith("ncaa") or PATH[league].startswith("soccer/")   # saved with the team number
     data = get_json(f"http://site.api.espn.com/apis/site/v2/sports/{PATH[league]}/teams?limit=2000")
     teams = [t["team"] for t in data["sports"][0]["leagues"][0]["teams"]]
     hits = []
@@ -68,7 +70,7 @@ def main():
         sys.exit(f"\n{len(hits)} matches: add more of the name so only one is left, then --add again.")
     t = hits[0]
     cur = get_json(f"http://{orb}/teams.json")
-    lines = [f"{c['league']} {c['abbr'].lower()}" + (f" {c['id']}" if c.get("id") and c["league"].startswith("ncaa") else "") for c in cur]
+    lines = [f"{c['league']} {c['abbr'].lower()}" + (f" {c['id']}" if c.get("id") and (c["league"].startswith("ncaa") or PATH.get(c["league"], "").startswith("soccer/")) else "") for c in cur]
     new = f"{league} {t['abbreviation'].lower()}" + (f" {t['id']}" if college else "")
     if new in lines:
         sys.exit("Already on the Orb's list.")

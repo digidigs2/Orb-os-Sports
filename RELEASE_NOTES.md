@@ -18,6 +18,15 @@ Rules for a section, all of them learned from what reads badly on that card:
 
 ---
 
+## 2.17.01-sports4
+
+- Football (soccer): the Premier League, La Liga, Bundesliga, Serie A, Ligue 1 and the
+  Champions League, with live minutes, HT and FT, and DRAW for a level result
+- Clubs are picked from the league's list, or by pasting their espn.com address with their
+  league chosen. MLS now works the same way (its team pages and logos were not loading)
+
+---
+
 ## 2.17.01-sports3
 
 - Scores load in the desktop simulator: ESPN refused the simulator's name for itself (it
