@@ -6,14 +6,85 @@
 > and football: MLS, the Premier League and the big European leagues). Everything else is Zion's firmware, unchanged. See **[docs/SPORTS.md](docs/SPORTS.md)**
 > for the Scores screen and how to pick your teams.
 >
-> **Installing:** build and flash with PlatformIO from this folder:
-> `pio run -e esp32-s3-amoled-175 -t upload` (first build downloads the tools, 5–15 minutes).
-> Orb Studio's *firmware update* button would replace this build with Zion's official one;
-> themes from Orb Studio work as normal.
+> **Installing:** download the firmware from this repository's
+> [Releases](https://github.com/digidigs2/Orb-os-Sports/releases) page (see
+> [Flashing a release](#flashing-a-release) below), or build and flash it yourself with
+> PlatformIO: `pio run -e esp32-s3-amoled-175 -t upload` (the first build downloads the tools,
+> 5–15 minutes). Orb Studio's *firmware update* button would replace this build with Zion's
+> official one; themes from Orb Studio work as normal.
 >
 > The Orb, Orb Studio and The Orb OS are Zion Brock's work; this fork only adds the Scores
 > screen. Licensed MIT like the original: see [LICENSE](LICENSE) and [NOTICE](NOTICE).
 
+
+## Choosing your teams
+
+The Scores screen shows **up to six teams**, one at a time, in the order you set. You choose
+them in a web browser on any phone or computer on the same WiFi as the Orb.
+
+1. Open **http://theorb.local/teams**. If that address does not open, use the Orb's IP
+   address followed by `/teams` (for example `http://192.168.1.42/teams`; your router's list of
+   connected devices shows it). There is also a **Scores teams** button on the Orb's main
+   web page.
+2. **Add a pro team:** choose the league (NFL, NHL, NBA, MLB, WNBA, MLS, Premier League,
+   La Liga, Bundesliga, Serie A, Ligue 1, Champions League), then the team, then **Add**. The
+   team's logo shows beside the list before you add it.
+3. **Add a college team** (football, men's or women's basketball, baseball): open the team on
+   [espn.com](https://www.espn.com), copy the address from the browser's address bar, paste
+   it into the box under *College teams, or any team by its address*, and press **Add**. For
+   example `https://www.espn.com/college-football/team/_/id/151/east-carolina-pirates`.
+4. **Add a football (soccer) club by its address:** choose its league in the league list
+   first, then paste the club's espn.com address (for example
+   `https://www.espn.com/soccer/team/_/id/384/crystal-palace`) and press **Add**. A club's
+   address does not say which league it plays in, so the page asks you to choose one.
+5. **Put them in order:** each team has three buttons on its row.
+   - **▲** moves the team up one place.
+   - **▼** moves it down one place.
+   - **✕** removes it.
+
+   The team at the top is the one the Scores screen opens on. Press ▲ or ▼ once for each place
+   you want it to move.
+6. Press **Save**. The Orb fetches the new teams' games straight away. Nothing changes on the
+   Orb until you save, so you can rearrange freely and leave the page to start over.
+
+<p align="center"><img src="docs/img/teams-page.png" width="480" alt="The teams page: six teams, each with up, down and remove buttons, then the league and team lists, Add and Save"></p>
+
+**Six at most.** With six teams on the list the **Add** button greys out and the page says
+*Six teams at most*. Remove one with ✕ to make room.
+
+**On the Orb:** open Scores from the app menu. Press the knob to go from a team's score to its
+upcoming games, and press again for the next team. Each team shows today's game if it has one
+(live while it is on), otherwise its last result.
+
+**Without the web page:** the list is the file `/teams.txt` on the Orb's SD card, one team per
+line in the order shown: `nhl car`, `nfl dal`, and college and football teams with ESPN's team
+number, `ncaaf ecu 151`, `epl cry 384`. Edit it by hand and restart the Orb. More detail is in
+[docs/SPORTS.md](docs/SPORTS.md).
+
+## Flashing a release
+
+Each [release](https://github.com/digidigs2/Orb-os-Sports/releases) has two files:
+
+- **`Orb-os-Sports-<version>-app.bin`**: for updating an Orb that already runs Zion's
+  firmware 2.17 or an earlier Orb-os-Sports. It keeps your WiFi, settings, theme and teams.
+  Write it at offset **0x10000**.
+- **`Orb-os-Sports-<version>-full.bin`**: the complete image, for a first install or to start
+  clean. Write it at offset **0x0**. It erases the stored WiFi and settings, so the Orb asks
+  for them again.
+
+In a browser (Chrome or Edge), with no tools to install: connect the Orb by USB-C, open
+[espressif.github.io/esptool-js](https://espressif.github.io/esptool-js/), press **Connect**
+and choose the Orb's port, set the **Flash Address** to the one above for the file you
+picked, choose the file, and press **Program**. Unplug and replug the Orb when it finishes.
+
+From a command line, with `pip install esptool`:
+
+```
+esptool.py --chip esp32s3 write_flash 0x10000 Orb-os-Sports-<version>-app.bin
+esptool.py --chip esp32s3 write_flash 0x0     Orb-os-Sports-<version>-full.bin
+```
+
+(one or the other, not both).
 
 <p align="center">
   <a href="https://zionbrock.com/orb"><img src="https://img.shields.io/badge/The%20Orb-zionbrock.com%2Forb-B5713E" alt="The Orb"></a>

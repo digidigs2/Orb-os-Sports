@@ -18,6 +18,15 @@ Rules for a section, all of them learned from what reads badly on that card:
 
 ---
 
+## 2.17.01-sports6
+
+- Hull City's next matches show again: a schedule saved by an earlier version, before club
+  fixtures were read, could hide them for an hour after a restart
+- A club's fixtures are read even when its results are not
+- The README explains picking and ordering your teams on the Orb's web page
+
+---
+
 ## 2.17.01-sports5
 
 - Football (soccer) clubs show their upcoming matches: ESPN lists a club's results and its

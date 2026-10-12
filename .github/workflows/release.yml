@@ -32,12 +32,14 @@ jobs:
         run: |
           B=.pio/build/esp32-s3-amoled-175
           BOOT_APP0="$(find "$HOME/.platformio/packages" -name boot_app0.bin -path '*framework-arduinoespressif32*' | head -1)"
-          python -m esptool --chip esp32s3 merge_bin -o TheOrbOS-esp32s3.bin \
+          V="${GITHUB_REF_NAME#v}"
+          python -m esptool --chip esp32s3 merge_bin -o "Orb-os-Sports-$V-full.bin" \
             --flash_mode dio --flash_freq 80m --flash_size 16MB \
             0x0     "$B/bootloader.bin" \
             0x8000  "$B/partitions.bin" \
             0xe000  "$BOOT_APP0" \
             0x10000 "$B/firmware.bin"
+          cp "$B/firmware.bin" "Orb-os-Sports-$V-app.bin"
 
       # WHAT CHANGED, in the words the person updating reads on the Flash button.
       #
@@ -49,14 +51,18 @@ jobs:
       - name: Write the flashing half of the body
         run: |
           cat > RELEASE_BODY.md <<'EOF'
-          **First flash (USB):** `TheOrbOS-esp32s3.bin` — the full merged image (offset `0x0`).
-          - Browser, no toolchain: https://zionbrock.com/orb
-          - Or: `esptool.py --chip esp32s3 write_flash 0x0 TheOrbOS-esp32s3.bin`
+          **Updating an Orb that runs Zion's firmware 2.17 or an earlier Orb-os-Sports:**
+          `Orb-os-Sports-<version>-app.bin` at offset `0x10000`. Keeps WiFi, settings, theme and teams.
 
-          **Updating an Orb you already have:** open Orb Studio and press Flash. It puts all
-          four files at the four offsets they belong at, which is the part that is easy to get
-          wrong by hand. There is no over-the-WiFi update: the device's OTA page is compiled
-          out, so do not go looking for `theorb.local/update`.
+          **First install, or starting clean:** `Orb-os-Sports-<version>-full.bin` at offset `0x0`.
+          Erases the stored WiFi and settings.
+
+          - Browser, no tools to install: https://espressif.github.io/esptool-js/ (Connect, set the
+            Flash Address, choose the file, Program)
+          - Or: `esptool.py --chip esp32s3 write_flash 0x10000 Orb-os-Sports-<version>-app.bin`
+
+          Orb Studio's Flash button installs Zion's official firmware, not this one.
+          Choosing teams: see the README, "Choosing your teams".
           EOF
         shell: bash
 
@@ -73,6 +79,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            TheOrbOS-esp32s3.bin
+            Orb-os-Sports-*-full.bin
+            Orb-os-Sports-*-app.bin
           generate_release_notes: true
           body_path: BODY.md
