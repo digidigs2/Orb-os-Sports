@@ -33,6 +33,7 @@
 #include "scores_view.h"
 #include "score_store.h"
 #include "logo_store.h"
+#include "sim_web.h"
 #include "ticker_view.h"
 #include "ticker.h"
 #include "app_shell.h"
@@ -689,6 +690,7 @@ static void sim_register_apps(lv_obj_t *radarScreen) {
     // device at exactly the moment someone is using it to check one.
     // Scores (Orbos-Sports), before Settings to match app_shell::Slot and main.cpp
     score_store::begin();
+    sim_web_start();                  // the /teams page on http://localhost:8080
     app_shell::addLazy("Scores", scoresview::build, scoresview::destroy,
                        scoresview::onPress, nullptr, false,
                        scoresview::onEnter, scoresview::onExit, false);

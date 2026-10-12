@@ -623,6 +623,61 @@ void begin() {
 
 void reload() { s_reload = true; }
 
+int team_list_reply(const char *league, const char **json) {
+    *json = nullptr;
+    if (league_index(league) < 0 || is_college(league)) return 404;
+    *json = team_list(league);
+    return *json ? 200 : 202;
+}
+
+int teams_json(char *out, size_t n) {
+    size_t o = 0;
+    auto put = [&](const char *s) { while (*s && o + 1 < n) out[o++] = *s++; };
+    put("[");
+    char lg[8], ab[8], id[8], nm[32];
+    for (int i = 0; entry(i, lg, ab, id, nm, sizeof(nm)); ++i) {
+        for (char *c = nm; *c; ++c) if (*c == '"' || *c == '\\' || (unsigned char)*c < 0x20) *c = '\'';
+        if (i) put(",");
+        put("{\"league\":\""); put(lg); put("\",\"abbr\":\""); put(ab);
+        put("\",\"id\":\""); put(id); put("\",\"name\":\""); put(nm); put("\"}");
+    }
+    put("]");
+    out[o < n ? o : n - 1] = 0;
+    return (int)o;
+}
+
+bool save_teams(const char *body, char *err, size_t errLen) {
+    char clean[6 * 32 + 1];
+    size_t o = 0;
+    int n = 0;
+    const char *p = body ? body : "";
+    while (*p) {
+        char line[64]; size_t k = 0;
+        while (*p && *p != '\n') { if (k < sizeof(line) - 1 && *p != '\r') line[k++] = *p; ++p; }
+        if (*p == '\n') ++p;
+        line[k] = 0;
+        char lg[16] = "", ab[16] = "", id[16] = "", extra[4] = "";
+        const int got = sscanf(line, "%15s %15s %15s %3s", lg, ab, id, extra);
+        if (got <= 0) continue;                                  // a blank line
+        lower(lg); lower(ab);
+        const bool college = is_college(lg);
+        bool ok = got >= 2 && got <= 3 && league_index(lg) >= 0 && strlen(ab) >= 1 && strlen(ab) <= 7;
+        for (const char *c = ab; ok && *c; ++c) ok = isalnum((unsigned char)*c);
+        ok = ok && strlen(id) <= 7 && (!college || id[0]);       // college teams need their number
+        for (const char *c = id; ok && *c; ++c) ok = isdigit((unsigned char)*c);
+        if (!ok) { snprintf(err, errLen, "bad team: %.40s", line); return false; }
+        if (++n > MAX_TEAMS) { snprintf(err, errLen, "six teams at most"); return false; }
+        o += snprintf(clean + o, sizeof(clean) - o, id[0] ? "%s %s %s\n" : "%s %s\n", lg, ab, id);
+    }
+    if (!theme_sd::write_whole(LIST_PATH, (const uint8_t *)clean, o)) {
+        snprintf(err, errLen, "could not write teams.txt (is the SD card in?)");
+        return false;
+    }
+    Serial.printf("[scores] teams.txt saved from the web page: %d team(s)\n", n);
+    reload();
+    return true;
+}
+
 const char *team_list(const char *league) {
     const int li = league_index(league);
     // Pro leagues only: a college list is hundreds of teams to download for one pick, so the

@@ -78,6 +78,18 @@ void reload();                  // teams.txt changed: the network task re-reads 
 // for the network task (the web server's task has neither the stack nor the time for it),
 // and the page asks again. Kept once fetched. `league` as in teams.txt ("nfl").
 const char *team_list(const char *league);
+
+// The /teams page's three requests, shared by the device's web server and the simulator's so
+// the two cannot differ. Each is safe to call from the web server's task.
+// /teamlist: 200 with *json set, 202 while the network task fetches it, 404 for a league the
+// page does not list (college teams are added by their espn.com address).
+int  team_list_reply(const char *league, const char **json);
+// /teams.json: the chosen teams as [{"league","abbr","id","name"}]. Returns the length.
+int  teams_json(char *out, size_t n);
+// /teamsave: one "<league> <code> [number]" per line. Every line is checked (a known league,
+// letters and digits, a number for college teams, six at most), then /teams.txt is written and
+// the teams re-read. false with a reason in err when anything is refused; nothing is written.
+bool save_teams(const char *body, char *err, size_t errLen);
 bool fetchStep();               // network task: refresh when due. true = new data
 void setVisible(bool on);       // the screen is showing: live games refresh faster
 

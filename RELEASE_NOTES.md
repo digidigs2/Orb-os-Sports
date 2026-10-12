@@ -18,6 +18,15 @@ Rules for a section, all of them learned from what reads badly on that card:
 
 ---
 
+## 2.17.01-sports2
+
+- The Flight Tracker no longer frees and rebuilds a large picture layer each time it moves
+  to the next aircraft, which wasted memory every few seconds and filled the log with
+  "lv_img_set_src: unknown type" warnings
+- The desktop simulator serves the teams page too, at http://localhost:8080/teams
+
+---
+
 ## 2.17.01-sports1
 
 - A Scores screen: your teams' live score, period and clock, today's game or the last

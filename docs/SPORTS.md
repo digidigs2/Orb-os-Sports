@@ -38,6 +38,27 @@ python3 tools/find_team.py ncaaf east carolina                    # prints: ncaa
 python3 tools/find_team.py ncaaf east carolina --add 192.168.1.50 # and adds it to the Orb
 ```
 
+## Trying it without an Orb: the desktop simulator
+
+The simulator runs the whole firmware in a window on a computer (Linux or macOS), with
+on-screen buttons for the knob, and fetches real scores from ESPN.
+
+```
+sudo apt install libsdl2-dev libcurl4-openssl-dev   # once (macOS: brew install sdl2)
+mkdir -p sim/sdcard                                  # stands in for the SD card
+pio run -e native -t exec
+```
+
+- Open Scores straight away: `SIM_APP=Scores .pio/build/native/program`
+- **Pick teams in a browser at http://localhost:8080/teams**, the same page the Orb serves. It
+  saves `sim/sdcard/teams.txt` and the simulator fetches the new teams at once.
+  (`SIM_WEB_PORT=8081` for another port, `SIM_WEB_PORT=0` to turn it off.)
+- Logos and the schedule cache land in `sim/sdcard/logos` and `sim/sdcard/scores`, and the
+  terminal shows the same `[scores]` / `[logos]` lines as the Orb's serial log.
+
+What it cannot show: the Orb's memory limits (a computer has far more), and the real ESP32
+build (GitHub builds that on every push to `main`).
+
 ## Where the data comes from
 
 ESPN's public scoreboard, team pages and schedules (`site.api.espn.com`, plain HTTP, no key).
@@ -63,6 +84,7 @@ Lines starting `[scores]` and `[logos]` say what was fetched, for example:
 ## Files added or changed
 
 New: `src/score_store.*` (data), `src/scores_view.*` (screen), `src/logo_store.*` (logos),
-`src/orb_empty_img.h`, `tools/find_team.py`, this file. Changed: `src/main.cpp` (screen
+`src/orb_empty_img.h`, `src/teams_page.h` (the /teams page), `src/sim_web.*` (the simulator's
+web server), `tools/find_team.py`, this file. Changed: `src/main.cpp` (screen
 registration, network step, the `/teams` page), `src/app_shell.h` (one slot),
 `src/theme_sd.*` (small file writes), `src/sim_main.cpp` and `platformio.ini` (simulator).
