@@ -1,4 +1,4 @@
-# Scores screen (Orbos-Sports)
+# Scores screen (Orb-os-Sports)
 
 This build is Zion Brock's **The Orb OS 2.17.01** with one addition: a **Scores** screen for the
 teams you follow. Everything else is Zion's firmware, unchanged.

@@ -96,7 +96,7 @@ namespace app_shell {
 #if !APPS_LAUNCH_ONE
         APP_TICKER,
 #endif
-        APP_SCORES,        // Scores (scores_view.cpp), Orbos-Sports
+        APP_SCORES,        // Scores (scores_view.cpp), Orb-os-Sports
         APP_SETTINGS,
         APP_COUNT,
     };

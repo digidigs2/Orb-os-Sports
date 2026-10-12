@@ -58,7 +58,7 @@
 #include "custom_apps.h"              // CUSTOM_APP_* — which apps a theme flash includes in the menu
 #include "spycam_view.h"             // Spy Cam: looping "security camera" flip-book
 #include "intel_view.h"
-#include "scores_view.h"         // Scores (Orbos-Sports)
+#include "scores_view.h"         // Scores (Orb-os-Sports)
 #include "score_store.h"
 #include "logo_store.h"
 #include "theme_sd.h"           // /teams.txt from the /teams page

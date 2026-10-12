@@ -691,7 +691,7 @@ static void sim_register_apps(lv_obj_t *radarScreen) {
     // After the Ticker, matching main.cpp. The selftests below address apps by index, so the
     // two lineups have to stay in the same order or the simulator stops standing in for the
     // device at exactly the moment someone is using it to check one.
-    // Scores (Orbos-Sports), before Settings to match app_shell::Slot and main.cpp
+    // Scores (Orb-os-Sports), before Settings to match app_shell::Slot and main.cpp
     score_store::begin();
     sim_web_start();                  // the /teams page on http://localhost:8080
     app_shell::addLazy("Scores", scoresview::build, scoresview::destroy,
