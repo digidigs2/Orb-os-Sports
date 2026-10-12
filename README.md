@@ -49,15 +49,6 @@ them in a web browser on any phone or computer on the same WiFi as the Orb.
 
 <p align="center"><img src="docs/img/teams-page.png" width="480" alt="The teams page: six teams, each with up, down and remove buttons, then the league and team lists, Add and Save"></p>
 
-**Your own background.** The Scores screen has a thin frame in your theme's colour. To use
-your own picture, scroll down the teams page to **Background picture**, choose a PNG and press
-**Upload**; it shows on the Orb straight away. Make it **466 × 466 pixels** to fill the round
-screen (a smaller one is centred). Transparent parts of the picture let the frame show
-through, so a PNG with a see-through middle sits *on top of* the frame, while an opaque one
-*replaces* it. Keep the middle dark or plain so the scores stay readable. **Use the frame**
-goes back to the default. The picture is stored on the SD card as `/scores.png`, so you can
-also copy it there by hand.
-
 **Six at most.** With six teams on the list the **Add** button greys out and the page says
 *Six teams at most*. Remove one with ✕ to make room.
 
@@ -69,6 +60,29 @@ upcoming games, and press again for the next team. Each team shows today's game 
 line in the order shown: `nhl car`, `nfl dal`, and college and football teams with ESPN's team
 number, `ncaaf ecu 151`, `epl cry 384`. Edit it by hand and restart the Orb. More detail is in
 [docs/SPORTS.md](docs/SPORTS.md).
+
+## Your own Scores background
+
+The Scores screen has a thin frame in your theme's colour by default. To use your own picture
+instead:
+
+1. Make a **PNG, 466 × 466 pixels** (the size of the round screen; a smaller one is centred).
+2. Open the teams page (**http://theorb.local/teams**) and scroll down to **Background
+   picture**.
+3. Choose the PNG and press **Upload**. The Orb shows it straight away.
+
+<p align="center"><img src="docs/img/scores-backgrounds.png" width="600" alt="Three Scores screens: the default frame, a ring picture with a clear middle on top of it, and an opaque picture replacing it"></p>
+
+How it combines with the frame (left to right above: the frame alone, a picture with a
+see-through middle, an opaque picture):
+
+- **An opaque picture replaces the frame.**
+- **Transparent parts let the frame show through**, so a PNG with a see-through middle sits
+  *on top of* the frame (a border, a team crest in a corner, a ring in your colours).
+
+Keep the middle dark or plain so the scores stay readable. **Use the frame** on the same page
+goes back to the default. The picture is stored on the SD card as `/scores.png`, so you can
+also copy it there by hand, or delete it to go back.
 
 ## Flashing a release
 
