@@ -3,10 +3,25 @@
 #include "logo_store.h"
 #include "orb_empty_img.h"
 #include "theme_style.h"
+#include "theme_sd.h"
+#include <PNGdec.h>
+#include <atomic>
+#include <new>
 #include <ctype.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
+#ifdef ARDUINO
+#include <Arduino.h>
+#include <esp_heap_caps.h>
+static void *bg_alloc(size_t n) { return heap_caps_malloc(n, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT); }
+static void bg_free(void *p) { heap_caps_free(p); }
+#else
+#include <stdlib.h>
+static struct { template <class... A> void printf(const char *f, A... a) const { ::printf(f, a...); } } Serial;
+static void *bg_alloc(size_t n) { return malloc(n); }
+static void bg_free(void *p) { free(p); }
+#endif
 
 namespace {
 
@@ -41,6 +56,88 @@ void colors() {
     c_dim = lv_color_hex(0x8A8A8A);
     c_faint = lv_color_hex(0x3A3A3A);
     c_live = lv_color_hex(0xFF3B30);
+}
+
+// ---------------------------------------------------------------- background
+lv_obj_t *s_frame, *s_bg;
+uint8_t      *s_bgBuf = nullptr;       // RGB565 + alpha, 3 bytes a pixel
+lv_img_dsc_t  s_bgDsc;
+std::atomic<unsigned> s_bgGen{1};      // bumped when the picture is saved or removed
+unsigned      s_bgLoaded = 0;
+
+PNG     *s_png = nullptr;
+uint8_t *s_dst = nullptr;
+int      s_dstW = 0;
+uint16_t s_line[466];
+
+int bg_line(PNGDRAW *d) {
+    uint8_t *o = s_dst + (size_t)d->y * s_dstW * 3;
+    const uint8_t *src = d->pPixels;
+    if (d->iPixelType == PNG_PIXEL_TRUECOLOR_ALPHA && d->iBpp == 8) {
+        for (int x = 0; x < d->iWidth; ++x, src += 4, o += 3) {
+            const uint16_t v = (uint16_t)(((src[0] & 0xF8) << 8) | ((src[1] & 0xFC) << 3) | (src[2] >> 3));
+            o[0] = v & 0xFF; o[1] = v >> 8; o[2] = src[3];
+        }
+    } else {
+        // every other kind of PNG: its colours through PNGdec, fully opaque
+        s_png->getLineAsRGB565(d, s_line, PNG_RGB565_LITTLE_ENDIAN, 0x000000);
+        for (int x = 0; x < d->iWidth; ++x, o += 3) { o[0] = s_line[x] & 0xFF; o[1] = s_line[x] >> 8; o[2] = 0xFF; }
+    }
+    return 1;
+}
+
+void bg_release() {
+    if (s_bg) { lv_img_cache_invalidate_src(&s_bgDsc); lv_obj_add_flag(s_bg, LV_OBJ_FLAG_HIDDEN); }
+    if (s_bgBuf) { bg_free(s_bgBuf); s_bgBuf = nullptr; }
+}
+
+// /scores.png from the card, decoded once each time the screen is built or the picture changes.
+void bg_load() {
+    s_bgLoaded = s_bgGen.load();
+    bg_release();
+    size_t len = 0;
+    uint8_t *file = theme_sd::read_whole(scoresview::BG_PATH, len, scoresview::BG_MAX_BYTES);
+    if (!file) return;                                  // none: the frame alone
+    if (!s_png) { void *m = bg_alloc(sizeof(PNG)); if (m) s_png = new (m) PNG(); }
+    bool ok = false;
+    int w = 0, h = 0;
+    if (s_png && s_png->openRAM(file, (int)len, bg_line) == PNG_SUCCESS) {
+        w = s_png->getWidth(); h = s_png->getHeight();
+        if (w > 0 && h > 0 && w <= 466 && h <= 466 && (s_bgBuf = (uint8_t *)bg_alloc((size_t)w * h * 3))) {
+            s_dst = s_bgBuf; s_dstW = w;
+            ok = s_png->decode(nullptr, 0) == PNG_SUCCESS;
+        }
+        s_png->close();
+    }
+    theme_sd::free(file);
+    if (!ok) {
+        Serial.printf("[scores] %s: not drawn (%dx%d; a PNG up to 466x466 is needed)\n", scoresview::BG_PATH, w, h);
+        if (s_bgBuf) { bg_free(s_bgBuf); s_bgBuf = nullptr; }
+        return;
+    }
+    memset(&s_bgDsc, 0, sizeof(s_bgDsc));
+    s_bgDsc.header.w = w;
+    s_bgDsc.header.h = h;
+    s_bgDsc.header.cf = LV_IMG_CF_TRUE_COLOR_ALPHA;
+    s_bgDsc.data_size = (uint32_t)w * h * 3;
+    s_bgDsc.data = s_bgBuf;
+    lv_img_set_src(s_bg, &s_bgDsc);
+    lv_obj_align(s_bg, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_clear_flag(s_bg, LV_OBJ_FLAG_HIDDEN);
+    Serial.printf("[scores] background %s, %dx%d\n", scoresview::BG_PATH, w, h);
+}
+
+// The default background: a ring just inside the edge of the dial, in the theme's accent.
+void frame_cb(lv_event_t *e) {
+    lv_draw_ctx_t *ctx = lv_event_get_draw_ctx(e);
+    lv_draw_rect_dsc_t d; lv_draw_rect_dsc_init(&d);
+    d.radius = LV_RADIUS_CIRCLE; d.bg_opa = LV_OPA_TRANSP;
+    d.border_color = c_accent; d.border_width = 3; d.border_opa = LV_OPA_70;
+    lv_area_t outer = {6, 6, 459, 459};
+    lv_draw_rect(ctx, &d, &outer);
+    d.border_color = c_accent; d.border_width = 1; d.border_opa = LV_OPA_30;
+    lv_area_t inner = {16, 16, 449, 449};
+    lv_draw_rect(ctx, &d, &inner);
 }
 
 void upper(char *s) { for (; *s; ++s) *s = (char)toupper((unsigned char)*s); }
@@ -252,6 +349,18 @@ void paint() {
 
 void build_contents() {
     s_built = true;
+    // under everything else: the frame, then the owner's picture over it
+    s_frame = lv_obj_create(s_scr);
+    lv_obj_remove_style_all(s_frame);
+    lv_obj_set_size(s_frame, 466, 466);
+    lv_obj_set_pos(s_frame, 0, 0);
+    lv_obj_clear_flag(s_frame, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(s_frame, frame_cb, LV_EVENT_DRAW_MAIN, nullptr);
+    s_bg = lv_img_create(s_scr);
+    lv_obj_clear_flag(s_bg, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(s_bg, LV_OBJ_FLAG_HIDDEN);
+    bg_load();
+
     s_art = lv_obj_create(s_scr);
     lv_obj_remove_style_all(s_art);
     lv_obj_set_size(s_art, 466, 466);
@@ -306,8 +415,10 @@ lv_obj_t *scoresview::build() {
 }
 
 void scoresview::destroy() {
+    bg_release();
     if (s_scr) lv_obj_del(s_scr);
     s_scr = nullptr;
+    s_frame = s_bg = nullptr;
     s_built = false;
     s_active = false;
     logo_store::release_all();      // after the objects that pointed at them are gone
@@ -336,6 +447,7 @@ void scoresview::onPress() {
 
 void scoresview::tick() {
     if (!s_active || !s_built) return;
+    if (s_bgLoaded != s_bgGen.load()) bg_load();         // uploaded or removed on the /teams page
     const uint32_t now = lv_tick_get();
     // repaint when the scores change, when a logo arrives, and every 20 s anyway so
     // "TONIGHT" turns over on time
@@ -348,3 +460,25 @@ void scoresview::tick() {
         paint();
     }
 }
+
+// ---------------------------------------------------------------- the /teams page's picture
+
+bool scoresview::save_background(const uint8_t *png, size_t len, char *err, size_t errLen) {
+    static const uint8_t SIG[8] = {0x89, 'P', 'N', 'G', '\r', '\n', 0x1A, '\n'};
+    if (len < 24 || memcmp(png, SIG, 8) || memcmp(png + 12, "IHDR", 4)) { snprintf(err, errLen, "That is not a PNG file."); return false; }
+    if (len > BG_MAX_BYTES) { snprintf(err, errLen, "Too big: %u KB, the most is %u KB.", (unsigned)(len / 1024), (unsigned)(BG_MAX_BYTES / 1024)); return false; }
+    const uint32_t w = (uint32_t)png[16] << 24 | (uint32_t)png[17] << 16 | (uint32_t)png[18] << 8 | png[19];
+    const uint32_t h = (uint32_t)png[20] << 24 | (uint32_t)png[21] << 16 | (uint32_t)png[22] << 8 | png[23];
+    if (!w || !h || w > 466 || h > 466) { snprintf(err, errLen, "The picture is %ux%u; the screen is 466x466, so it can be at most that.", (unsigned)w, (unsigned)h); return false; }
+    if (!theme_sd::write_whole(BG_PATH, png, len)) { snprintf(err, errLen, "Could not write it to the SD card."); return false; }
+    s_bgGen.fetch_add(1);
+    return true;
+}
+
+bool scoresview::remove_background() {
+    const bool ok = theme_sd::remove(BG_PATH);
+    s_bgGen.fetch_add(1);
+    return ok;
+}
+
+bool scoresview::has_background() { return theme_sd::exists(BG_PATH); }

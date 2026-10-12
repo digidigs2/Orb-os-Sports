@@ -54,6 +54,13 @@ College football, men's and women's basketball and baseball all work, and so doe
 team's address. For a football (soccer) club, also pick its league in the list above first:
 its address does not say which league it plays in.</p>
 <div class=bar><input id=murl style="flex:1;min-width:0" placeholder="https://www.espn.com/.../team/_/..."><button class=btn id=madd>Add</button></div>
+<h1 style="font-size:16px;margin-top:20px">Background picture</h1>
+<p>The Scores screen has a frame in your theme's colour. Upload a PNG to use your own
+picture instead: 466 x 466 pixels fills the round screen (smaller is centred). Transparent
+parts of the picture let the frame show through, so a PNG with a see-through middle sits on
+top of it. Keep the middle dark or plain so the scores stay readable.</p>
+<div class=bar><span id=bgnow style="color:#98a2ad">Now: ...</span></div>
+<div class=bar><input type=file id=bgf accept="image/png"><button class=btn id=bgup>Upload</button><button class=btn id=bgdel>Use the frame</button></div>
 <script>
 const PATH={nfl:'football/nfl',nhl:'hockey/nhl',nba:'basketball/nba',mlb:'baseball/mlb',wnba:'basketball/wnba',mls:'soccer/usa.1',
   epl:'soccer/eng.1',laliga:'soccer/esp.1',bundes:'soccer/ger.1',seriea:'soccer/ita.1',ligue1:'soccer/fra.1',ucl:'soccer/uefa.champions'};
@@ -153,6 +160,25 @@ $('save').onclick=async()=>{
     if(r.ok)say('Saved. The Orb is fetching the games now.','ok');else say('Not saved: '+t,'bad');
   }catch(e){say('Not saved: '+e,'bad');}
 };
+async function bgNow(){
+  try{const t=await (await fetch('/scoresbg')).text();
+    $('bgnow').textContent='Now: '+(t=='custom'?'your picture (scores.png)':'the frame');}catch(e){}
+}
+$('bgup').onclick=async()=>{
+  const f=$('bgf').files[0];
+  if(!f){say('Choose a PNG file first.','bad');return;}
+  const fd=new FormData();fd.append('file',f,'scores.png');
+  say('Uploading '+f.name+'...');
+  try{const r=await fetch('/scoresbg',{method:'POST',body:fd});const t=await r.text();
+    if(r.ok)say('Picture saved. The Scores screen shows it now.','ok');else say('Not saved: '+t,'bad');
+  }catch(e){say('Not saved: '+e,'bad');}
+  bgNow();
+};
+$('bgdel').onclick=async()=>{
+  try{await fetch('/scoresbgdel',{method:'POST'});say('Back to the frame.','ok');}catch(e){say('Failed: '+e,'bad');}
+  bgNow();
+};
+bgNow();
 (async()=>{
   try{const r=await fetch('/teams.json');teams=await r.json();}catch(e){teams=[];}
   draw();

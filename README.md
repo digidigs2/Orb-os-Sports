@@ -49,6 +49,15 @@ them in a web browser on any phone or computer on the same WiFi as the Orb.
 
 <p align="center"><img src="docs/img/teams-page.png" width="480" alt="The teams page: six teams, each with up, down and remove buttons, then the league and team lists, Add and Save"></p>
 
+**Your own background.** The Scores screen has a thin frame in your theme's colour. To use
+your own picture, scroll down the teams page to **Background picture**, choose a PNG and press
+**Upload**; it shows on the Orb straight away. Make it **466 × 466 pixels** to fill the round
+screen (a smaller one is centred). Transparent parts of the picture let the frame show
+through, so a PNG with a see-through middle sits *on top of* the frame, while an opaque one
+*replaces* it. Keep the middle dark or plain so the scores stay readable. **Use the frame**
+goes back to the default. The picture is stored on the SD card as `/scores.png`, so you can
+also copy it there by hand.
+
 **Six at most.** With six teams on the list the **Add** button greys out and the page says
 *Six teams at most*. Remove one with ✕ to make room.
 

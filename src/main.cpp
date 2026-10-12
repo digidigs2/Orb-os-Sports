@@ -2497,6 +2497,11 @@ static void handleSdPutUpload() {
     }
 }
 
+// The /scoresbg upload in progress (see the handler where /teams is served).
+static uint8_t *g_bgUpBuf = nullptr;
+static size_t   g_bgUpLen = 0;
+static bool     g_bgUpOver = false;
+
 static void handleSdPutDone() {
     g_web.send(g_sdUpOk ? 200 : 500, "text/plain", g_sdUpOk ? "ok" : "failed");
 }
@@ -3575,6 +3580,32 @@ void setup() {
         char err[96];
         if (score_store::save_teams(g_web.arg("plain").c_str(), err, sizeof(err))) g_web.send(200, "text/plain", "ok");
         else g_web.send(400, "text/plain", err);
+    });
+    // The Scores screen's own picture (/scores.png), uploaded from the /teams page. Collected
+    // in PSRAM and handed to scoresview::save_background, which the simulator's server also
+    // uses, so the checks (a PNG, at most 466x466) are the same in both.
+    g_web.on("/scoresbg", HTTP_GET, []{ g_web.send(200, "text/plain", scoresview::has_background() ? "custom" : "default"); });
+    g_web.on("/scoresbg", HTTP_POST, []{
+        char err[112] = "Nothing arrived.";
+        bool ok = false;
+        if (g_bgUpBuf && !g_bgUpOver) ok = scoresview::save_background(g_bgUpBuf, g_bgUpLen, err, sizeof(err));
+        else if (g_bgUpOver) snprintf(err, sizeof(err), "Too big: the most is %u KB.", (unsigned)(scoresview::BG_MAX_BYTES / 1024));
+        if (g_bgUpBuf) { heap_caps_free(g_bgUpBuf); g_bgUpBuf = nullptr; }
+        g_web.send(ok ? 200 : 400, "text/plain", ok ? "ok" : err);
+    }, []{
+        HTTPUpload &up = g_web.upload();
+        if (up.status == UPLOAD_FILE_START) {
+            if (g_bgUpBuf) heap_caps_free(g_bgUpBuf);
+            g_bgUpBuf = (uint8_t *)heap_caps_malloc(scoresview::BG_MAX_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            g_bgUpLen = 0;
+            g_bgUpOver = false;
+        } else if (up.status == UPLOAD_FILE_WRITE && g_bgUpBuf) {
+            if (g_bgUpLen + up.currentSize > scoresview::BG_MAX_BYTES) g_bgUpOver = true;
+            else { memcpy(g_bgUpBuf + g_bgUpLen, up.buf, up.currentSize); g_bgUpLen += up.currentSize; }
+        }
+    });
+    g_web.on("/scoresbgdel", HTTP_POST, []{
+        g_web.send(scoresview::remove_background() ? 200 : 500, "text/plain", "ok");
     });
     // What is on the card, for the page above. The same answer the serial link gives, which
     // matters now that a cable is optional: Studio is served over HTTPS and can never call

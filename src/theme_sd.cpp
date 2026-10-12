@@ -68,6 +68,18 @@ bool write_whole(const char *path, const uint8_t *data, size_t len) {
     return put == len;
 }
 
+bool exists(const char *path) {
+    if (!sdcard::mounted()) return false;
+    Held held;
+    return SD.exists(path);
+}
+
+bool remove(const char *path) {
+    if (!sdcard::mounted()) return false;
+    Held held;
+    return !SD.exists(path) || SD.remove(path);
+}
+
 bool make_dir(const char *path) {
     if (!sdcard::mounted()) return false;
     Held held;
@@ -102,6 +114,18 @@ bool write_whole(const char *path, const uint8_t *data, size_t len) {
     const size_t put = fwrite(data, 1, len, f);
     fclose(f);
     return put == len;
+}
+
+bool exists(const char *path) {
+    struct stat st;
+    return ::stat((std::string(SIM_SD_ROOT) + path).c_str(), &st) == 0;
+}
+
+bool remove(const char *path) {
+    const std::string full = std::string(SIM_SD_ROOT) + path;
+    ::remove(full.c_str());
+    struct stat st;
+    return ::stat(full.c_str(), &st) != 0;
 }
 
 bool make_dir(const char *path) {

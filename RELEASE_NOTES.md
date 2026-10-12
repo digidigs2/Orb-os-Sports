@@ -18,6 +18,14 @@ Rules for a section, all of them learned from what reads badly on that card:
 
 ---
 
+## 2.17.01-sports7
+
+- The Scores screen has a frame in your theme's colour, and can show your own picture
+  instead: upload a PNG on the teams page. A picture with a see-through middle sits on top
+  of the frame; an opaque one replaces it
+
+---
+
 ## 2.17.01-sports6
 
 - Hull City's next matches show again: a schedule saved by an earlier version, before club

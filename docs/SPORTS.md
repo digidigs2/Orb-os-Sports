@@ -31,6 +31,12 @@ by `/teams`). There is also a **Scores teams** button on the Orb's main web page
 - Use ▲ ▼ to order them and ✕ to remove one, then **Save**. The Orb fetches the new teams'
   games straight away.
 
+**Background:** a frame in the theme's accent colour, unless the card holds `/scores.png`
+(uploaded from the teams page's *Background picture*, or copied there by hand). That picture
+is drawn over the frame, centred, at most 466 × 466: opaque parts replace the frame,
+transparent parts let it show through. Any PNG works; it is decoded when the screen opens
+(about 650 KB of PSRAM while Scores is showing, given back when it closes).
+
 The list is stored on the SD card as `/teams.txt`, one team per line (`nhl car`, `nfl dal`,
 college and soccer teams with ESPN's team number: `ncaaf ecu 151`, `epl cry 384`). You can also edit that file by hand
 and restart.

@@ -26,6 +26,10 @@ uint8_t *read_whole(const char *path, size_t &outLen, size_t maxBytes);
 void free(uint8_t *buf);
 // Replace a small file in one go (a cache, not artwork). Takes the same lock as read_whole.
 bool write_whole(const char *path, const uint8_t *data, size_t len);
+// Whether a file is there.
+bool exists(const char *path);
+// Delete a file. true if it is gone afterwards (including when it was never there).
+bool remove(const char *path);
 // Create one directory level if it is missing (e.g. "/logos"). true if it exists afterwards.
 bool make_dir(const char *path);
 
